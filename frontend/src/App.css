@@ -1,0 +1,134 @@
+/* App.css */
+:root {
+  --bg-dark: #0f172a;
+  --bg-sidebar: #1e293b;
+  --bg-card: #1e293b;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --accent: #3b82f6;
+  --healthy: #10b981;
+  --unhealthy: #ef4444;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+}
+
+.dashboard-container {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: 250px;
+  background-color: var(--bg-sidebar);
+  padding: 20px 0;
+  border-right: 1px solid #334155;
+}
+
+.logo {
+  font-size: 1.5rem;
+  font-weight: bold;
+  text-align: center;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #334155;
+  margin-bottom: 20px;
+  color: var(--accent);
+}
+
+.nav-links {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.nav-links li {
+  padding: 15px 25px;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.2s;
+  font-weight: 500;
+}
+
+.nav-links li:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: var(--text-main);
+}
+
+.nav-links li.active {
+  background-color: rgba(59, 130, 246, 0.1);
+  color: var(--accent);
+  border-left: 4px solid var(--accent);
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 40px;
+  background-color: var(--bg-dark);
+  border-bottom: 1px solid #334155;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.status-indicator {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.status {
+  padding: 4px 10px;
+  border-radius: 4px;
+  margin-left: 8px;
+}
+
+.status.healthy {
+  background-color: rgba(16, 185, 129, 0.15);
+  color: var(--healthy);
+}
+
+.status.unhealthy {
+  background-color: rgba(239, 68, 68, 0.15);
+  color: var(--unhealthy);
+}
+
+.content {
+  padding: 40px;
+}
+
+.card {
+  background-color: var(--bg-card);
+  border-radius: 12px;
+  padding: 30px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  border: 1px solid #334155;
+}
+
+.card h2 {
+  margin-top: 0;
+}
+
+.health-details {
+  background-color: #0f172a;
+  padding: 20px;
+  border-radius: 8px;
+  overflow-x: auto;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9rem;
+  border: 1px solid #334155;
+}
