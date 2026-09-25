@@ -8,7 +8,7 @@ import sys
 from database import SessionLocal, engine
 import models
 import schemas
-from detection.scanner import detect_port_scan
+from detection.scanner import detect_port_scan, detect_network_sweep
 
 def setup_db():
     models.Base.metadata.create_all(bind=engine)
@@ -74,10 +74,78 @@ def test_port_scan_traffic(db):
     print(alert.description)
     print("Evidence:", alert.evidence)
 
+def test_sweep_normal_traffic(db):
+    print("Testing sweep – normal traffic...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # Only 4 distinct destination IPs on port 80 – below threshold of 10
+    for i in range(4):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.1.1.1",
+            src_port=50000,
+            dst_ip=f"172.16.0.{i+1}",
+            dst_port=80,
+            protocol="tcp",
+            connection_state="S0"
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_network_sweep(db, time_window_seconds=60, threshold=10)
+    assert alerts == 0, f"Expected 0 alerts, got {alerts}"
+    print("Sweep normal traffic test passed.")
+
+
+def test_sweep_detection(db):
+    print("Testing network sweep detection...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # 15 distinct destination IPs all on port 445 – above threshold of 10
+    for i in range(15):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.2.2.2",
+            src_port=60000 + i,
+            dst_ip=f"192.168.50.{i+1}",
+            dst_port=445,
+            protocol="tcp",
+            connection_state="S0"
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_network_sweep(db, time_window_seconds=60, threshold=10)
+    assert alerts == 1, f"Expected 1 alert, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "Network Sweep Detected"
+    ).first()
+    assert alert is not None
+    assert alert.src_ip == "10.2.2.2"
+    assert alert.dst_ip == "port:445"
+    assert alert.rule_name == "Network Sweep Detected"
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["ip_count"] >= 10
+    assert ev["destination_port"] == 445
+    print("Network sweep detection test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
 if __name__ == "__main__":
     db = setup_db()
     try:
         test_normal_traffic(db)
         test_port_scan_traffic(db)
+        test_sweep_normal_traffic(db)
+        test_sweep_detection(db)
     finally:
         db.close()

@@ -86,7 +86,7 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-from detection.scanner import detect_port_scan
+from detection.scanner import detect_port_scan, detect_network_sweep
 
 @app.post("/api/detect/portscan")
 def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
@@ -95,6 +95,17 @@ def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Sess
     """
     try:
         alerts_created = detect_port_scan(db, time_window, threshold)
+        return {"status": "success", "alerts_created": alerts_created}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/detect/sweep")
+def run_network_sweep_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
+    """
+    Run network sweep detection on the current connection events.
+    """
+    try:
+        alerts_created = detect_network_sweep(db, time_window, threshold)
         return {"status": "success", "alerts_created": alerts_created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
