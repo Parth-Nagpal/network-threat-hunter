@@ -1,3 +1,4 @@
+from datetime import datetime
 from sqlalchemy import Column, Integer, String, Float, DateTime
 from database import Base
 
@@ -61,4 +62,21 @@ class Alert(Base):
     dst_ip = Column(String, index=True)
     description = Column(String)
     evidence = Column(String)
+    # Workflow metadata is populated by the ORM for existing detection paths.
+    status = Column(String, nullable=False, default="open", index=True)
+    severity = Column(String, nullable=False, default="medium", index=True)
+    alert_type = Column(String, nullable=False, default="unknown", index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
+    def __init__(self, **kwargs):
+        rule_name = kwargs.get("rule_name", "")
+        kwargs.setdefault("alert_type", rule_name.removesuffix(" Detected") or "unknown")
+        severity_by_type = {
+            "SSH Brute Force Detected": "high",
+            "Port Scan Detected": "medium",
+            "Network Sweep Detected": "medium",
+            "DNS Anomaly Detected": "medium",
+            "Beaconing Detected": "high",
+        }
+        kwargs.setdefault("severity", severity_by_type.get(rule_name, "medium"))
+        super().__init__(**kwargs)

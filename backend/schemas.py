@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 
 class ConnectionEventCreate(BaseModel):
@@ -50,5 +50,15 @@ class AlertCreate(BaseModel):
 
 class AlertResponse(AlertCreate):
     id: int
+    alert_type: str
+    severity: str
+    status: str
+    created_at: datetime
     class Config:
         from_attributes = True
+
+class AlertStatusUpdate(BaseModel):
+    status: Literal["open", "investigating", "resolved", "false_positive"]
+
+    class Config:
+        extra = "forbid"
