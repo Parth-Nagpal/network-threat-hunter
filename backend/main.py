@@ -86,7 +86,7 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly
 
 @app.post("/api/detect/portscan")
 def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
@@ -117,6 +117,22 @@ def run_ssh_brute_force_detection(time_window: int = 60, threshold: int = 5, db:
     """
     try:
         alerts_created = detect_ssh_brute_force(db, time_window, threshold)
+        return {"status": "success", "alerts_created": alerts_created}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/detect/dnsanomaly")
+def run_dns_anomaly_detection(
+    time_window: int = 60,
+    query_count_threshold: int = 100,
+    max_query_length: int = 50,
+    db: Session = Depends(get_db),
+):
+    """
+    Run DNS anomaly detection (high frequency + long query names) on DNS events.
+    """
+    try:
+        alerts_created = detect_dns_anomaly(db, time_window, query_count_threshold, max_query_length)
         return {"status": "success", "alerts_created": alerts_created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

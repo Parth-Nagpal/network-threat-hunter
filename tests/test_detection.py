@@ -8,7 +8,7 @@ import sys
 from database import SessionLocal, engine
 import models
 import schemas
-from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly
 
 def setup_db():
     models.Base.metadata.create_all(bind=engine)
@@ -252,6 +252,105 @@ def test_ssh_brute_force_with_success(db):
     print("Evidence:", alert.evidence)
 
 
+def test_dns_normal_traffic(db):
+    print("Testing DNS anomaly – normal traffic...")
+    db.query(models.DNSEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # 10 short, infrequent DNS queries – well below both thresholds
+    for i in range(10):
+        event = models.DNSEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="192.168.10.1",
+            dst_dns_server="8.8.8.8",
+            queried_domain=f"example{i}.com",
+            query_type="A",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_dns_anomaly(db, time_window_seconds=60, query_count_threshold=100, max_query_length=50)
+    assert alerts == 0, f"Expected 0 alerts, got {alerts}"
+    print("DNS normal traffic test passed.")
+
+
+def test_dns_high_frequency(db):
+    print("Testing DNS anomaly – high query frequency...")
+    db.query(models.DNSEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # 120 DNS queries within 60 seconds – above frequency threshold of 100
+    for i in range(120):
+        event = models.DNSEvent(
+            timestamp=now + datetime.timedelta(seconds=i % 59),
+            src_ip="10.50.50.1",
+            dst_dns_server="8.8.8.8",
+            queried_domain=f"normal{i}.com",
+            query_type="A",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_dns_anomaly(db, time_window_seconds=60, query_count_threshold=100, max_query_length=50)
+    assert alerts == 1, f"Expected 1 alert, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "DNS Anomaly Detected"
+    ).first()
+    assert alert is not None
+    assert alert.src_ip == "10.50.50.1"
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["high_frequency"] is True
+    assert ev["query_count"] >= 100
+    print("DNS high-frequency test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
+def test_dns_long_query(db):
+    print("Testing DNS anomaly – long query name...")
+    db.query(models.DNSEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # A small number of queries but one has a suspiciously long domain (DNS tunnel / DGA)
+    normal_domains = [f"legit{i}.com" for i in range(5)]
+    tunnel_domain = "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZlcnkgbG9uZyBkbnMgdHVubmVsIHF1ZXJ5".ljust(70, "x") + ".evil.com"
+    all_domains = normal_domains + [tunnel_domain]
+
+    for i, domain in enumerate(all_domains):
+        event = models.DNSEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.60.60.1",
+            dst_dns_server="8.8.8.8",
+            queried_domain=domain,
+            query_type="TXT",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_dns_anomaly(db, time_window_seconds=60, query_count_threshold=100, max_query_length=50)
+    assert alerts == 1, f"Expected 1 alert, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "DNS Anomaly Detected"
+    ).first()
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["max_query_length"] > 50
+    assert len(ev["long_domains_sample"]) >= 1
+    assert ev["high_frequency"] is False
+    print("DNS long-query test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
 if __name__ == "__main__":
     db = setup_db()
     try:
@@ -262,5 +361,8 @@ if __name__ == "__main__":
         test_ssh_normal_traffic(db)
         test_ssh_brute_force(db)
         test_ssh_brute_force_with_success(db)
+        test_dns_normal_traffic(db)
+        test_dns_high_frequency(db)
+        test_dns_long_query(db)
     finally:
         db.close()

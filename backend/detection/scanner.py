@@ -249,3 +249,104 @@ def detect_ssh_brute_force(
                 window_start = i + 1
 
     return alerts_created
+
+
+def detect_dns_anomaly(
+    db: Session,
+    time_window_seconds: int = 60,
+    query_count_threshold: int = 100,
+    max_query_length: int = 50,
+) -> int:
+    """
+    Detects DNS anomalies from DNS events in the database.
+
+    Two signals are combined per source IP within each time window:
+      1. High query frequency  – total DNS queries >= query_count_threshold
+      2. Long query names      – any queried_domain longer than max_query_length
+         (typical of DNS tunnelling or DGA-generated names)
+
+    Both signals are evaluated together; an alert is raised if either fires.
+    Evidence includes source IP, query count, max query length, and a sample
+    of the suspicious (long) domain names observed.
+
+    Returns the number of new alerts generated.
+    """
+    dns_events = (
+        db.query(
+            models.DNSEvent.src_ip,
+            models.DNSEvent.queried_domain,
+            models.DNSEvent.timestamp,
+        )
+        .order_by(models.DNSEvent.timestamp)
+        .all()
+    )
+
+    # Group by src_ip → list of (timestamp, queried_domain)
+    grouped: dict = {}
+    for d in dns_events:
+        grouped.setdefault(d.src_ip, []).append((d.timestamp, d.queried_domain))
+
+    alerts_created = 0
+
+    for src_ip, events in grouped.items():
+        window_start = 0
+
+        for i in range(len(events)):
+            current_time, _ = events[i]
+
+            # Slide window
+            while (current_time - events[window_start][0]).total_seconds() > time_window_seconds:
+                window_start += 1
+
+            window_events = events[window_start : i + 1]
+            query_count = len(window_events)
+            domains = [e[1] for e in window_events]
+            long_domains = [d for d in domains if len(d) > max_query_length]
+            actual_max_len = max((len(d) for d in domains), default=0)
+
+            high_frequency = query_count >= query_count_threshold
+            long_names = bool(long_domains)
+
+            if high_frequency or long_names:
+                existing_alert = db.query(models.Alert).filter(
+                    models.Alert.rule_name == "DNS Anomaly Detected",
+                    models.Alert.src_ip == src_ip,
+                    models.Alert.timestamp >= current_time - timedelta(seconds=time_window_seconds),
+                ).first()
+
+                if not existing_alert:
+                    signals = []
+                    if high_frequency:
+                        signals.append(f"high query frequency ({query_count} queries)")
+                    if long_names:
+                        signals.append(f"long domain names (max length {actual_max_len})")
+
+                    evidence = {
+                        "query_count": query_count,
+                        "max_query_length": actual_max_len,
+                        "long_domains_sample": long_domains[:10],
+                        "high_frequency": high_frequency,
+                        "time_window": time_window_seconds,
+                    }
+                    desc = (
+                        f"Source {src_ip} triggered DNS anomaly: "
+                        + " and ".join(signals)
+                        + f" within {time_window_seconds} seconds."
+                    )
+                    alert_schema = schemas.AlertCreate(
+                        timestamp=current_time,
+                        rule_name="DNS Anomaly Detected",
+                        src_ip=src_ip,
+                        dst_ip="dns",
+                        description=desc,
+                        evidence=json.dumps(evidence),
+                    )
+                    db_alert = models.Alert(**alert_schema.model_dump())
+                    db.add(db_alert)
+                    db.commit()
+                    alerts_created += 1
+
+                # Advance past this burst
+                window_start = i + 1
+
+    return alerts_created
