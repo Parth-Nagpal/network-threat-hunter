@@ -83,3 +83,18 @@ class IncidentUpdate(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+class AnalystNoteCreate(BaseModel):
+    content: str
+
+    class Config:
+        extra = "forbid"
+
+
+class InvestigationActionCreate(BaseModel):
+    action_type: Literal["reviewed", "marked_suspicious", "marked_benign", "escalated"]
+    comment: str = ""
+
+    class Config:
+        extra = "forbid"

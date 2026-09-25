@@ -94,6 +94,8 @@ class Incident(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     alert_links = relationship("IncidentAlert", back_populates="incident", cascade="all, delete-orphan")
+    notes = relationship("IncidentNote", back_populates="incident", cascade="all, delete-orphan")
+    actions = relationship("InvestigationAction", back_populates="incident", cascade="all, delete-orphan")
 
 
 class IncidentAlert(Base):
@@ -103,3 +105,24 @@ class IncidentAlert(Base):
     alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="CASCADE"), primary_key=True)
     incident = relationship("Incident", back_populates="alert_links")
     alert = relationship("Alert")
+
+
+class IncidentNote(Base):
+    __tablename__ = "incident_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False, index=True)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    incident = relationship("Incident", back_populates="notes")
+
+
+class InvestigationAction(Base):
+    __tablename__ = "investigation_actions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False, index=True)
+    action_type = Column(String, nullable=False, index=True)
+    comment = Column(String, nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    incident = relationship("Incident", back_populates="actions")

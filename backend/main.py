@@ -2,11 +2,13 @@ import os
 import shutil
 import tempfile
 import json
-from datetime import datetime
+import ipaddress
+from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, or_
 
 from database import check_db_connection, get_db, engine
 import models
@@ -113,7 +115,10 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
-from schemas import AlertResponse, AlertStatusUpdate, IncidentCreate, IncidentUpdate
+from schemas import (
+    AlertResponse, AlertStatusUpdate, IncidentCreate, IncidentUpdate,
+    AnalystNoteCreate, InvestigationActionCreate,
+)
 from correlation import correlate_open_alerts
 
 
@@ -320,6 +325,255 @@ def _incident_response(incident: models.Incident, include_timeline: bool = True)
             for alert in response["alerts"]
         ]
     return response
+
+
+def _normalized_telemetry(model, event_type, row):
+    if model is models.ConnectionEvent:
+        destination_ip = row.dst_ip
+        source_port, destination_port = row.src_port, row.dst_port
+        protocol = row.protocol
+        details = {
+            "connection_state": row.connection_state,
+            "duration": row.duration,
+            "bytes_sent": row.bytes_sent,
+            "bytes_received": row.bytes_received,
+        }
+    elif model is models.DNSEvent:
+        destination_ip = row.dst_dns_server
+        source_port = destination_port = None
+        protocol = "dns"
+        details = {"queried_domain": row.queried_domain, "query_type": row.query_type,
+                   "response_code": row.response_code}
+    elif model is models.HTTPEvent:
+        destination_ip = row.dst_ip
+        source_port = destination_port = None
+        protocol = "http"
+        details = {"method": row.method, "host": row.host, "uri": row.uri,
+                   "status_code": row.status_code, "user_agent": row.user_agent}
+    else:
+        destination_ip = row.dst_ip
+        source_port = destination_port = None
+        protocol = "tls"
+        details = {"server_name": row.server_name, "version": row.version, "cipher": row.cipher}
+    return {
+        "id": row.id,
+        "event_type": event_type,
+        "timestamp": row.timestamp,
+        "source_ip": row.src_ip,
+        "destination_ip": destination_ip,
+        "source_port": source_port,
+        "destination_port": destination_port,
+        "protocol": protocol,
+        "details": details,
+    }
+
+
+def _related_incident_telemetry(db, related_ips, start_at, end_at, limit):
+    if not related_ips:
+        return []
+    sources = [
+        (models.ConnectionEvent, "connection", models.ConnectionEvent.dst_ip),
+        (models.DNSEvent, "dns", models.DNSEvent.dst_dns_server),
+        (models.HTTPEvent, "http", models.HTTPEvent.dst_ip),
+        (models.SSLEvent, "tls", models.SSLEvent.dst_ip),
+    ]
+    results = []
+    for model, event_type, destination_column in sources:
+        query = db.query(model).filter(
+            model.timestamp >= start_at,
+            model.timestamp <= end_at,
+            or_(model.src_ip.in_(related_ips), destination_column.in_(related_ips)),
+        )
+        rows = query.order_by(model.timestamp.desc(), model.id.desc()).limit(limit).all()
+        results.extend(_normalized_telemetry(model, event_type, row) for row in rows)
+    results.sort(key=lambda item: (item["timestamp"], item["id"]), reverse=True)
+    return results[:limit]
+
+
+def _extract_incident_iocs(alerts, telemetry):
+    ips, domains, urls, ports = set(), set(), set(), set()
+
+    def add_ip(value):
+        if value is None:
+            return
+        try:
+            ips.add(str(ipaddress.ip_address(str(value).strip())))
+        except ValueError:
+            pass
+
+    def add_domain(value):
+        if not isinstance(value, str):
+            return
+        candidate = value.strip().rstrip(".")
+        if not candidate:
+            return
+        try:
+            candidate = urlsplit("//" + candidate).hostname or candidate
+            ipaddress.ip_address(candidate)
+            return
+        except ValueError:
+            pass
+        if "." in candidate and " " not in candidate:
+            domains.add(candidate.lower())
+
+    def add_url(value):
+        if not isinstance(value, str):
+            return
+        parsed = urlsplit(value.strip())
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            urls.add(value.strip())
+
+    def add_port(value):
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return
+        if 0 <= port <= 65535:
+            ports.add(port)
+
+    for alert in alerts:
+        add_ip(alert.src_ip)
+        add_ip(alert.dst_ip)
+        try:
+            evidence = json.loads(alert.evidence) if alert.evidence else {}
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        if isinstance(evidence, dict):
+            for key in ("ips_observed", "ip_addresses", "source_ips", "destination_ips"):
+                values = evidence.get(key, [])
+                for value in values if isinstance(values, (list, tuple, set)) else [values]:
+                    add_ip(value)
+            for key in ("long_domains_sample", "domains", "queried_domain"):
+                values = evidence.get(key, [])
+                for value in values if isinstance(values, (list, tuple, set)) else [values]:
+                    add_domain(value)
+            for key in ("urls", "url"):
+                values = evidence.get(key, [])
+                for value in values if isinstance(values, (list, tuple, set)) else [values]:
+                    add_url(value)
+            for key in ("destination_port", "dst_port", "ports_observed", "destination_ports"):
+                values = evidence.get(key, [])
+                for value in values if isinstance(values, (list, tuple, set)) else [values]:
+                    add_port(value)
+
+    for event in telemetry:
+        add_ip(event["source_ip"])
+        add_ip(event["destination_ip"])
+        if event["destination_port"] is not None:
+            add_port(event["destination_port"])
+        details = event["details"]
+        if event["event_type"] == "dns":
+            add_domain(details.get("queried_domain"))
+        elif event["event_type"] == "http":
+            add_domain(details.get("host"))
+            add_url(details.get("uri"))
+        elif event["event_type"] == "tls":
+            add_domain(details.get("server_name"))
+
+    return {
+        "ip_addresses": sorted(ips),
+        "domains": sorted(domains),
+        "urls": sorted(urls),
+        "destination_ports": sorted(ports),
+    }
+
+
+@app.get("/api/incidents/{incident_id}/investigation")
+def get_incident_investigation(
+    incident_id: int,
+    window_minutes: int = Query(default=10, ge=1, le=1440),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    alerts = sorted(
+        (link.alert for link in incident.alert_links),
+        key=lambda alert: (alert.timestamp or datetime.min, alert.id),
+    )
+    activity_times = [alert.timestamp for alert in alerts if alert.timestamp is not None]
+    if activity_times:
+        start_at = min(activity_times) - timedelta(minutes=window_minutes)
+        end_at = max(activity_times) + timedelta(minutes=window_minutes)
+    else:
+        start_at = incident.created_at - timedelta(minutes=window_minutes)
+        end_at = incident.created_at + timedelta(minutes=window_minutes)
+    related_ips = set()
+    for alert in alerts:
+        for value in (alert.src_ip, alert.dst_ip):
+            try:
+                related_ips.add(str(ipaddress.ip_address(str(value).strip())))
+            except (TypeError, ValueError):
+                continue
+    telemetry = _related_incident_telemetry(db, related_ips, start_at, end_at, limit)
+    result = _incident_response(incident)
+    result.update({
+        "related_telemetry": telemetry,
+        "iocs": _extract_incident_iocs(alerts, telemetry),
+        "notes": [
+            {"id": note.id, "incident_id": note.incident_id, "content": note.content,
+             "created_at": note.created_at}
+            for note in sorted(incident.notes, key=lambda item: (item.created_at, item.id))
+        ],
+        "actions": [
+            {"id": action.id, "incident_id": action.incident_id, "action_type": action.action_type,
+             "comment": action.comment, "created_at": action.created_at}
+            for action in sorted(incident.actions, key=lambda item: (item.created_at, item.id))
+        ],
+        "investigation_window": {"from": start_at, "to": end_at, "window_minutes": window_minutes},
+    })
+    return result
+
+
+@app.post("/api/incidents/{incident_id}/notes")
+def add_incident_note(incident_id: int, payload: AnalystNoteCreate, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    note = models.IncidentNote(incident_id=incident_id, content=payload.content)
+    db.add(note)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(note)
+    return {"id": note.id, "incident_id": note.incident_id, "content": note.content,
+            "created_at": note.created_at}
+
+
+@app.post("/api/incidents/{incident_id}/actions")
+def add_incident_action(
+    incident_id: int,
+    payload: InvestigationActionCreate,
+    db: Session = Depends(get_db),
+):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    action = models.InvestigationAction(
+        incident_id=incident_id,
+        action_type=payload.action_type,
+        comment=payload.comment,
+    )
+    db.add(action)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(action)
+    return {"id": action.id, "incident_id": action.incident_id, "action_type": action.action_type,
+            "comment": action.comment, "created_at": action.created_at}
+
+
+@app.delete("/api/incidents/{incident_id}/notes/{note_id}")
+def delete_incident_note(incident_id: int, note_id: int, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    note = db.query(models.IncidentNote).filter_by(id=note_id, incident_id=incident_id).first()
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    db.delete(note)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "deleted", "incident_id": incident_id, "note_id": note_id}
 
 
 @app.get("/api/incidents")
