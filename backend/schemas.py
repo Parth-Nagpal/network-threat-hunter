@@ -62,3 +62,24 @@ class AlertStatusUpdate(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+IncidentStatus = Literal["open", "investigating", "resolved", "false_positive"]
+IncidentSeverity = Literal["low", "medium", "high", "critical"]
+
+
+class IncidentCreate(BaseModel):
+    title: str
+    summary: str = ""
+    severity: IncidentSeverity = "medium"
+    status: IncidentStatus = "open"
+
+
+class IncidentUpdate(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    severity: Optional[IncidentSeverity] = None
+    status: Optional[IncidentStatus] = None
+
+    class Config:
+        extra = "forbid"

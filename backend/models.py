@@ -1,5 +1,6 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
 from database import Base
 
 class ConnectionEvent(Base):
@@ -80,3 +81,25 @@ class Alert(Base):
         }
         kwargs.setdefault("severity", severity_by_type.get(rule_name, "medium"))
         super().__init__(**kwargs)
+
+
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    summary = Column(String, nullable=False, default="")
+    severity = Column(String, nullable=False, default="medium", index=True)
+    status = Column(String, nullable=False, default="open", index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    alert_links = relationship("IncidentAlert", back_populates="incident", cascade="all, delete-orphan")
+
+
+class IncidentAlert(Base):
+    __tablename__ = "incident_alerts"
+
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), primary_key=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="CASCADE"), primary_key=True)
+    incident = relationship("Incident", back_populates="alert_links")
+    alert = relationship("Alert")

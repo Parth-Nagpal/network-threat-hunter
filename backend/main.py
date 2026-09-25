@@ -113,7 +113,8 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
-from schemas import AlertResponse, AlertStatusUpdate
+from schemas import AlertResponse, AlertStatusUpdate, IncidentCreate, IncidentUpdate
+from correlation import correlate_open_alerts
 
 
 @app.get("/api/hunt")
@@ -275,6 +276,131 @@ def update_alert_status(alert_id: int, update: AlertStatusUpdate, db: Session = 
     db.commit()
     db.refresh(alert)
     return alert
+
+
+def _incident_response(incident: models.Incident, include_timeline: bool = True):
+    response = {
+        "id": incident.id,
+        "title": incident.title,
+        "summary": incident.summary,
+        "severity": incident.severity,
+        "status": incident.status,
+        "created_at": incident.created_at,
+        "updated_at": incident.updated_at,
+    }
+    if include_timeline:
+        alerts = sorted(
+            (link.alert for link in incident.alert_links),
+            key=lambda alert: (alert.timestamp or datetime.min, alert.id),
+        )
+        response["alerts"] = [
+            {
+                "id": alert.id,
+                "timestamp": alert.timestamp,
+                "type": alert.alert_type,
+                "rule_name": alert.rule_name,
+                "severity": alert.severity,
+                "source_ip": alert.src_ip,
+                "destination_ip": alert.dst_ip,
+                "description": alert.description,
+                "evidence": alert.evidence,
+            }
+            for alert in alerts
+        ]
+        response["timeline"] = [
+            {
+                "timestamp": alert["timestamp"],
+                "type": alert["type"],
+                "rule_name": alert["rule_name"],
+                "severity": alert["severity"],
+                "source_ip": alert["source_ip"],
+                "destination_ip": alert["destination_ip"],
+                "evidence": alert["evidence"],
+            }
+            for alert in response["alerts"]
+        ]
+    return response
+
+
+@app.get("/api/incidents")
+def list_incidents(limit: int = Query(default=100, ge=1, le=500), db: Session = Depends(get_db)):
+    incidents = db.query(models.Incident).order_by(
+        models.Incident.created_at.desc(), models.Incident.id.desc()
+    ).limit(limit).all()
+    return [_incident_response(incident, include_timeline=False) for incident in incidents]
+
+
+@app.get("/api/incidents/{incident_id}")
+def get_incident(incident_id: int, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return _incident_response(incident)
+
+
+@app.post("/api/incidents")
+def create_incident(payload: IncidentCreate, db: Session = Depends(get_db)):
+    incident = models.Incident(**payload.model_dump())
+    db.add(incident)
+    db.commit()
+    db.refresh(incident)
+    return _incident_response(incident)
+
+
+@app.patch("/api/incidents/{incident_id}")
+def update_incident(incident_id: int, payload: IncidentUpdate, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    for field, value in payload.model_dump(exclude_unset=True, exclude_none=True).items():
+        setattr(incident, field, value)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(incident)
+    return _incident_response(incident)
+
+
+@app.post("/api/incidents/{incident_id}/alerts/{alert_id}")
+def add_alert_to_incident(incident_id: int, alert_id: int, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    link = db.query(models.IncidentAlert).filter_by(incident_id=incident_id, alert_id=alert_id).first()
+    if link is None:
+        db.add(models.IncidentAlert(incident_id=incident_id, alert_id=alert_id))
+        incident.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(incident)
+    return _incident_response(incident)
+
+
+@app.delete("/api/incidents/{incident_id}/alerts/{alert_id}")
+def remove_alert_from_incident(incident_id: int, alert_id: int, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    link = db.query(models.IncidentAlert).filter_by(incident_id=incident_id, alert_id=alert_id).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="Alert is not associated with this incident")
+    db.delete(link)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "removed", "incident_id": incident_id, "alert_id": alert_id}
+
+
+@app.post("/api/incidents/correlate")
+def run_incident_correlation(
+    window_minutes: int = Query(default=10, ge=1, le=1440),
+    db: Session = Depends(get_db),
+):
+    incidents = correlate_open_alerts(db, window_minutes=window_minutes)
+    return {
+        "incidents_created": len(incidents),
+        "incidents": [_incident_response(incident) for incident in incidents],
+    }
 
 @app.post("/api/detect/portscan")
 def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
