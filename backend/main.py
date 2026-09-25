@@ -1,6 +1,16 @@
-from fastapi import FastAPI, Depends
+import os
+import shutil
+import tempfile
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from database import check_db_connection
+from sqlalchemy.orm import Session
+
+from database import check_db_connection, get_db, engine
+import models
+from ingestion.parser import run_zeek, parse_and_store
+
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Network Threat Hunter API",
@@ -40,3 +50,38 @@ def api_info():
         "version": "0.1.0",
         "description": "API for network threat hunting and investigation"
     }
+
+@app.post("/api/ingest/pcap")
+async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Ingest a PCAP file, process it with Zeek, and store normalized events.
+    """
+    if not file.filename.endswith(".pcap") and not file.filename.endswith(".pcapng"):
+        raise HTTPException(status_code=400, detail="Only .pcap and .pcapng files are supported")
+    
+    # Create temp directory
+    temp_dir = tempfile.mkdtemp()
+    pcap_path = os.path.join(temp_dir, file.filename)
+    
+    try:
+        # Save uploaded file
+        with open(pcap_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Run Zeek
+        zeek_out_dir = os.path.join(temp_dir, "logs")
+        run_zeek(pcap_path, zeek_out_dir)
+        
+        # Parse and store
+        stats = parse_and_store(zeek_out_dir, db)
+        
+        return {
+            "status": "success",
+            "file": file.filename,
+            "events": stats
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup
+        shutil.rmtree(temp_dir, ignore_errors=True)
