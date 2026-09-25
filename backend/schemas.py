@@ -98,3 +98,14 @@ class InvestigationActionCreate(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+class MitreTechniqueResponse(BaseModel):
+    technique_id: str
+    name: str
+    description: str
+    tactic: str
+    source_detection_type: str
+
+    class Config:
+        from_attributes = True

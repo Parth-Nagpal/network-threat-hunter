@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text, or_
 
-from database import check_db_connection, get_db, engine
+from database import check_db_connection, get_db, engine, SessionLocal
 import models
 from ingestion.parser import run_zeek, parse_and_store
 
@@ -117,9 +117,16 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
 from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
 from schemas import (
     AlertResponse, AlertStatusUpdate, IncidentCreate, IncidentUpdate,
-    AnalystNoteCreate, InvestigationActionCreate,
+    AnalystNoteCreate, InvestigationActionCreate, MitreTechniqueResponse,
 )
 from correlation import correlate_open_alerts
+from mitre import ALERT_TYPE_TO_TECHNIQUE, seed_mitre_techniques
+
+mitre_seed_session = SessionLocal()
+try:
+    seed_mitre_techniques(mitre_seed_session)
+finally:
+    mitre_seed_session.close()
 
 
 @app.get("/api/hunt")
@@ -327,6 +334,84 @@ def _incident_response(incident: models.Incident, include_timeline: bool = True)
     return response
 
 
+def _incident_mitre_techniques(incident: models.Incident, db: Session):
+    technique_ids = {
+        link.technique_id
+        for link in db.query(models.IncidentTechnique).filter_by(incident_id=incident.id).all()
+    }
+    for link in incident.alert_links:
+        technique_id = ALERT_TYPE_TO_TECHNIQUE.get(link.alert.alert_type)
+        if technique_id:
+            technique_ids.add(technique_id)
+    if not technique_ids:
+        return []
+    techniques = db.query(models.MitreTechnique).filter(
+        models.MitreTechnique.technique_id.in_(technique_ids)
+    ).order_by(models.MitreTechnique.tactic, models.MitreTechnique.technique_id).all()
+    return [
+        {
+            "technique_id": technique.technique_id,
+            "name": technique.name,
+            "description": technique.description,
+            "tactic": technique.tactic,
+            "source_detection_type": technique.source_detection_type,
+        }
+        for technique in techniques
+    ]
+
+
+@app.get("/api/mitre/techniques", response_model=list[MitreTechniqueResponse])
+def list_mitre_techniques(db: Session = Depends(get_db)):
+    return db.query(models.MitreTechnique).order_by(
+        models.MitreTechnique.tactic, models.MitreTechnique.technique_id
+    ).all()
+
+
+@app.get("/api/mitre/incidents/{incident_id}")
+def get_incident_mitre_techniques(incident_id: int, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"incident_id": incident_id, "techniques": _incident_mitre_techniques(incident, db)}
+
+
+@app.post("/api/incidents/{incident_id}/techniques/{technique_id}")
+def add_incident_technique(incident_id: int, technique_id: str, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    technique = db.query(models.MitreTechnique).filter_by(technique_id=technique_id).first()
+    if technique is None:
+        raise HTTPException(status_code=404, detail="MITRE technique not found")
+    association = db.query(models.IncidentTechnique).filter_by(
+        incident_id=incident_id, technique_id=technique_id
+    ).first()
+    if association is None:
+        db.add(models.IncidentTechnique(incident_id=incident_id, technique_id=technique_id))
+        incident.updated_at = datetime.utcnow()
+        db.commit()
+    return {"incident_id": incident_id, "techniques": _incident_mitre_techniques(incident, db)}
+
+
+@app.delete("/api/incidents/{incident_id}/techniques/{technique_id}")
+def remove_incident_technique(incident_id: int, technique_id: str, db: Session = Depends(get_db)):
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    technique = db.query(models.MitreTechnique).filter_by(technique_id=technique_id).first()
+    if technique is None:
+        raise HTTPException(status_code=404, detail="MITRE technique not found")
+    association = db.query(models.IncidentTechnique).filter_by(
+        incident_id=incident_id, technique_id=technique_id
+    ).first()
+    if association is None:
+        raise HTTPException(status_code=404, detail="Technique is not manually associated with this incident")
+    db.delete(association)
+    incident.updated_at = datetime.utcnow()
+    db.commit()
+    return {"incident_id": incident_id, "techniques": _incident_mitre_techniques(incident, db)}
+
+
 def _normalized_telemetry(model, event_type, row):
     if model is models.ConnectionEvent:
         destination_ip = row.dst_ip
@@ -511,6 +596,7 @@ def get_incident_investigation(
     result.update({
         "related_telemetry": telemetry,
         "iocs": _extract_incident_iocs(alerts, telemetry),
+        "mitre_techniques": _incident_mitre_techniques(incident, db),
         "notes": [
             {"id": note.id, "incident_id": note.incident_id, "content": note.content,
              "created_at": note.created_at}

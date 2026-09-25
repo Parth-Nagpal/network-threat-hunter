@@ -126,3 +126,22 @@ class InvestigationAction(Base):
     comment = Column(String, nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     incident = relationship("Incident", back_populates="actions")
+
+
+class MitreTechnique(Base):
+    __tablename__ = "mitre_techniques"
+
+    technique_id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=False)
+    tactic = Column(String, nullable=False, index=True)
+    source_detection_type = Column(String, nullable=False)
+
+
+class IncidentTechnique(Base):
+    __tablename__ = "incident_techniques"
+
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), primary_key=True)
+    technique_id = Column(String, ForeignKey("mitre_techniques.technique_id", ondelete="CASCADE"), primary_key=True)
+    incident = relationship("Incident")
+    technique = relationship("MitreTechnique")
