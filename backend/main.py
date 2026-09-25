@@ -86,7 +86,7 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-from detection.scanner import detect_port_scan, detect_network_sweep
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force
 
 @app.post("/api/detect/portscan")
 def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
@@ -106,6 +106,17 @@ def run_network_sweep_detection(time_window: int = 60, threshold: int = 10, db: 
     """
     try:
         alerts_created = detect_network_sweep(db, time_window, threshold)
+        return {"status": "success", "alerts_created": alerts_created}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/detect/sshbruteforce")
+def run_ssh_brute_force_detection(time_window: int = 60, threshold: int = 5, db: Session = Depends(get_db)):
+    """
+    Run SSH brute-force detection on the current connection events.
+    """
+    try:
+        alerts_created = detect_ssh_brute_force(db, time_window, threshold)
         return {"status": "success", "alerts_created": alerts_created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

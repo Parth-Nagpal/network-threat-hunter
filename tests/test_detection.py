@@ -8,7 +8,7 @@ import sys
 from database import SessionLocal, engine
 import models
 import schemas
-from detection.scanner import detect_port_scan, detect_network_sweep
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force
 
 def setup_db():
     models.Base.metadata.create_all(bind=engine)
@@ -140,6 +140,118 @@ def test_sweep_detection(db):
     print("Evidence:", alert.evidence)
 
 
+def test_ssh_normal_traffic(db):
+    print("Testing SSH brute force – normal traffic...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # Only 3 failed SSH attempts – below threshold of 5
+    for i in range(3):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.10.10.1",
+            src_port=40000 + i,
+            dst_ip="10.10.10.50",
+            dst_port=22,
+            protocol="tcp",
+            connection_state="REJ",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_ssh_brute_force(db, time_window_seconds=60, threshold=5)
+    assert alerts == 0, f"Expected 0 alerts, got {alerts}"
+    print("SSH normal traffic test passed.")
+
+
+def test_ssh_brute_force(db):
+    print("Testing SSH brute force detection...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # 8 failed SSH attempts – above threshold of 5
+    for i in range(8):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.20.20.1",
+            src_port=50000 + i,
+            dst_ip="10.20.20.100",
+            dst_port=22,
+            protocol="tcp",
+            connection_state="REJ",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_ssh_brute_force(db, time_window_seconds=60, threshold=5)
+    assert alerts == 1, f"Expected 1 alert, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "SSH Brute Force Detected"
+    ).first()
+    assert alert is not None
+    assert alert.src_ip == "10.20.20.1"
+    assert alert.dst_ip == "10.20.20.100"
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["failed_attempts"] >= 5
+    assert ev["successful_login"] is False
+    print("SSH brute force test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
+def test_ssh_brute_force_with_success(db):
+    print("Testing SSH brute force with subsequent successful login...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # 6 failed attempts followed by 1 successful login
+    for i in range(6):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=i),
+            src_ip="10.30.30.1",
+            src_port=55000 + i,
+            dst_ip="10.30.30.200",
+            dst_port=22,
+            protocol="tcp",
+            connection_state="S0",
+        )
+        db.add(event)
+    # Successful SSH login after failures
+    success_event = models.ConnectionEvent(
+        timestamp=now + datetime.timedelta(seconds=7),
+        src_ip="10.30.30.1",
+        src_port=55100,
+        dst_ip="10.30.30.200",
+        dst_port=22,
+        protocol="tcp",
+        connection_state="SF",
+    )
+    db.add(success_event)
+    db.commit()
+
+    alerts = detect_ssh_brute_force(db, time_window_seconds=60, threshold=5)
+    assert alerts == 1, f"Expected 1 alert, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "SSH Brute Force Detected"
+    ).first()
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["successful_login"] is True
+    assert len(ev["success_timestamps"]) >= 1
+    print("SSH brute force + successful login test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
 if __name__ == "__main__":
     db = setup_db()
     try:
@@ -147,5 +259,8 @@ if __name__ == "__main__":
         test_port_scan_traffic(db)
         test_sweep_normal_traffic(db)
         test_sweep_detection(db)
+        test_ssh_normal_traffic(db)
+        test_ssh_brute_force(db)
+        test_ssh_brute_force_with_success(db)
     finally:
         db.close()

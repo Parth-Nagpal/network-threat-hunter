@@ -145,3 +145,107 @@ def detect_network_sweep(db: Session, time_window_seconds: int = 60, threshold: 
                 window_start = i + 1
 
     return alerts_created
+
+
+# Zeek connection states that indicate a failed/rejected connection
+_SSH_FAIL_STATES = {"S0", "REJ", "RSTO", "RSTOS0", "RSTR", "RSTRH", "SH", "SHR", "OTH"}
+# Zeek connection states that indicate a successfully established session
+_SSH_SUCCESS_STATES = {"SF", "S1", "S2", "S3"}
+
+
+def detect_ssh_brute_force(
+    db: Session,
+    time_window_seconds: int = 60,
+    threshold: int = 5,
+) -> int:
+    """
+    Detects SSH brute-force attempts from connection events in the database.
+
+    A brute-force is flagged when the same source IP makes more than `threshold`
+    failed SSH connections (dst_port == 22) to the same destination IP within
+    `time_window_seconds`.  If a successful SSH connection follows the failures
+    it is included in the evidence.
+
+    Returns the number of new alerts generated.
+    """
+    # Fetch only SSH traffic (port 22), ordered by time
+    ssh_conns = (
+        db.query(
+            models.ConnectionEvent.src_ip,
+            models.ConnectionEvent.dst_ip,
+            models.ConnectionEvent.connection_state,
+            models.ConnectionEvent.timestamp,
+        )
+        .filter(models.ConnectionEvent.dst_port == 22)
+        .order_by(models.ConnectionEvent.timestamp)
+        .all()
+    )
+
+    # Group by (src_ip, dst_ip) → list of (timestamp, connection_state)
+    grouped: dict = {}
+    for c in ssh_conns:
+        key = (c.src_ip, c.dst_ip)
+        grouped.setdefault(key, []).append((c.timestamp, c.connection_state))
+
+    alerts_created = 0
+
+    for (src_ip, dst_ip), events in grouped.items():
+        window_start = 0
+
+        for i in range(len(events)):
+            current_time, _ = events[i]
+
+            # Slide the window
+            while (current_time - events[window_start][0]).total_seconds() > time_window_seconds:
+                window_start += 1
+
+            window_events = events[window_start : i + 1]
+            failed = [e for e in window_events if e[1] in _SSH_FAIL_STATES]
+
+            if len(failed) >= threshold:
+                # Deduplicate: skip if an alert already covers this window
+                existing_alert = db.query(models.Alert).filter(
+                    models.Alert.rule_name == "SSH Brute Force Detected",
+                    models.Alert.src_ip == src_ip,
+                    models.Alert.dst_ip == dst_ip,
+                    models.Alert.timestamp >= current_time - timedelta(seconds=time_window_seconds),
+                ).first()
+
+                if not existing_alert:
+                    # Scan the rest of events within the same window for any success
+                    window_end_time = events[window_start][0] + timedelta(seconds=time_window_seconds)
+                    success = [
+                        e for e in events[i + 1:]
+                        if e[0] <= window_end_time and e[1] in _SSH_SUCCESS_STATES
+                    ]
+
+                    evidence = {
+                        "failed_attempts": len(failed),
+                        "time_window": time_window_seconds,
+                        "successful_login": bool(success),
+                        "success_timestamps": [str(e[0]) for e in success],
+                    }
+                    desc = (
+                        f"Source {src_ip} made {len(failed)} failed SSH attempts "
+                        f"to {dst_ip} within {time_window_seconds} seconds."
+                    )
+                    if success:
+                        desc += " A subsequent successful login was observed."
+
+                    alert_schema = schemas.AlertCreate(
+                        timestamp=current_time,
+                        rule_name="SSH Brute Force Detected",
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        description=desc,
+                        evidence=json.dumps(evidence),
+                    )
+                    db_alert = models.Alert(**alert_schema.model_dump())
+                    db.add(db_alert)
+                    db.commit()
+                    alerts_created += 1
+
+                # Advance past this burst to avoid duplicate alerts
+                window_start = i + 1
+
+    return alerts_created
