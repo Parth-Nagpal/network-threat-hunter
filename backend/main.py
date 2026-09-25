@@ -86,13 +86,11 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
 
 @app.post("/api/detect/portscan")
 def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
-    """
-    Run port scan detection on the current connection events.
-    """
+    """Run port scan detection on the current connection events."""
     try:
         alerts_created = detect_port_scan(db, time_window, threshold)
         return {"status": "success", "alerts_created": alerts_created}
@@ -101,9 +99,7 @@ def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Sess
 
 @app.post("/api/detect/sweep")
 def run_network_sweep_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
-    """
-    Run network sweep detection on the current connection events.
-    """
+    """Run network sweep detection on the current connection events."""
     try:
         alerts_created = detect_network_sweep(db, time_window, threshold)
         return {"status": "success", "alerts_created": alerts_created}
@@ -112,9 +108,7 @@ def run_network_sweep_detection(time_window: int = 60, threshold: int = 10, db: 
 
 @app.post("/api/detect/sshbruteforce")
 def run_ssh_brute_force_detection(time_window: int = 60, threshold: int = 5, db: Session = Depends(get_db)):
-    """
-    Run SSH brute-force detection on the current connection events.
-    """
+    """Run SSH brute-force detection on the current connection events."""
     try:
         alerts_created = detect_ssh_brute_force(db, time_window, threshold)
         return {"status": "success", "alerts_created": alerts_created}
@@ -128,11 +122,23 @@ def run_dns_anomaly_detection(
     max_query_length: int = 50,
     db: Session = Depends(get_db),
 ):
-    """
-    Run DNS anomaly detection (high frequency + long query names) on DNS events.
-    """
+    """Run DNS anomaly detection (high frequency + long query names) on DNS events."""
     try:
         alerts_created = detect_dns_anomaly(db, time_window, query_count_threshold, max_query_length)
+        return {"status": "success", "alerts_created": alerts_created}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/detect/beaconing")
+def run_beaconing_detection(
+    time_window: int = 3600,
+    min_connections: int = 5,
+    max_jitter_cov: float = 0.25,
+    db: Session = Depends(get_db),
+):
+    """Run beaconing detection based on interval regularity of repeated connections."""
+    try:
+        alerts_created = detect_beaconing(db, time_window, min_connections, max_jitter_cov)
         return {"status": "success", "alerts_created": alerts_created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

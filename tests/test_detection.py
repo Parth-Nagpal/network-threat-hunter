@@ -8,7 +8,7 @@ import sys
 from database import SessionLocal, engine
 import models
 import schemas
-from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly
+from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
 
 def setup_db():
     models.Base.metadata.create_all(bind=engine)
@@ -351,6 +351,79 @@ def test_dns_long_query(db):
     print("Evidence:", alert.evidence)
 
 
+def test_beaconing_normal_traffic(db):
+    print("Testing beaconing – irregular (normal) traffic...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # Highly irregular intervals: 1s, 30s, 5s, 120s, 2s — CoV will be very high
+    offsets = [0, 1, 31, 36, 156, 158]
+    for i, secs in enumerate(offsets):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=secs),
+            src_ip="172.16.1.1",
+            src_port=30000 + i,
+            dst_ip="1.2.3.4",
+            dst_port=443,
+            protocol="tcp",
+            connection_state="SF",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_beaconing(db, time_window_seconds=3600, min_connections=5, max_jitter_cov=0.25)
+    assert alerts == 0, f"Expected 0 alerts for irregular traffic, got {alerts}"
+    print("Beaconing normal traffic test passed.")
+
+
+def test_beaconing_detection(db):
+    print("Testing beaconing – periodic beacon traffic...")
+    db.query(models.ConnectionEvent).delete()
+    db.query(models.Alert).delete()
+    db.commit()
+
+    now = datetime.datetime.utcnow()
+    # Very regular: every 60s ± 2s (CoV ≪ 0.25)
+    base_interval = 60
+    import random; random.seed(42)
+    offsets = [0]
+    for _ in range(7):
+        offsets.append(offsets[-1] + base_interval + random.uniform(-1, 1))
+
+    for i, secs in enumerate(offsets):
+        event = models.ConnectionEvent(
+            timestamp=now + datetime.timedelta(seconds=secs),
+            src_ip="10.99.99.1",
+            src_port=40000 + i,
+            dst_ip="203.0.113.5",
+            dst_port=443,
+            protocol="tcp",
+            connection_state="SF",
+        )
+        db.add(event)
+    db.commit()
+
+    alerts = detect_beaconing(db, time_window_seconds=3600, min_connections=5, max_jitter_cov=0.25)
+    assert alerts == 1, f"Expected 1 alert for beacon traffic, got {alerts}"
+
+    alert = db.query(models.Alert).filter(
+        models.Alert.rule_name == "Beaconing Detected"
+    ).first()
+    assert alert is not None
+    assert alert.src_ip == "10.99.99.1"
+    assert alert.dst_ip == "203.0.113.5"
+    import json
+    ev = json.loads(alert.evidence)
+    assert ev["connection_count"] >= 5
+    assert ev["interval_cov"] <= 0.25
+    assert ev["avg_interval_seconds"] > 0
+    print("Beaconing detection test passed. Alert generated:")
+    print(alert.description)
+    print("Evidence:", alert.evidence)
+
+
 if __name__ == "__main__":
     db = setup_db()
     try:
@@ -364,5 +437,7 @@ if __name__ == "__main__":
         test_dns_normal_traffic(db)
         test_dns_high_frequency(db)
         test_dns_long_query(db)
+        test_beaconing_normal_traffic(db)
+        test_beaconing_detection(db)
     finally:
         db.close()

@@ -350,3 +350,115 @@ def detect_dns_anomaly(
                 window_start = i + 1
 
     return alerts_created
+
+
+def detect_beaconing(
+    db: Session,
+    time_window_seconds: int = 3600,
+    min_connections: int = 5,
+    max_jitter_cov: float = 0.25,
+) -> int:
+    """
+    Detects beaconing (C2 call-home) behaviour from connection events.
+
+    Groups connections by (src_ip, dst_ip) and computes inter-connection
+    intervals within each time window.  When:
+      - there are at least `min_connections` connections, AND
+      - the coefficient of variation (stddev / mean) of the intervals is
+        at or below `max_jitter_cov`  (i.e. the intervals are suspiciously
+        regular),
+    an alert is raised.
+
+    Evidence includes: connection count, list of observed intervals (seconds),
+    average interval, and the computed CoV.
+
+    Returns the number of new alerts generated.
+    """
+    import statistics
+
+    connections = (
+        db.query(
+            models.ConnectionEvent.src_ip,
+            models.ConnectionEvent.dst_ip,
+            models.ConnectionEvent.timestamp,
+        )
+        .order_by(models.ConnectionEvent.timestamp)
+        .all()
+    )
+
+    # Group by (src_ip, dst_ip) → sorted list of timestamps
+    grouped: dict = {}
+    for c in connections:
+        key = (c.src_ip, c.dst_ip)
+        grouped.setdefault(key, []).append(c.timestamp)
+
+    alerts_created = 0
+
+    for (src_ip, dst_ip), timestamps in grouped.items():
+        window_start = 0
+
+        for i in range(len(timestamps)):
+            current_time = timestamps[i]
+
+            # Slide window
+            while (current_time - timestamps[window_start]).total_seconds() > time_window_seconds:
+                window_start += 1
+
+            window_ts = timestamps[window_start : i + 1]
+
+            if len(window_ts) < min_connections:
+                continue  # not enough data yet
+
+            # Compute intervals (seconds) between consecutive connections
+            intervals = [
+                (window_ts[j] - window_ts[j - 1]).total_seconds()
+                for j in range(1, len(window_ts))
+            ]
+
+            if len(intervals) < 2:
+                continue  # need at least 2 intervals to compute CoV
+
+            avg_interval = statistics.mean(intervals)
+            if avg_interval == 0:
+                continue  # avoid division by zero
+
+            stdev = statistics.stdev(intervals)
+            cov = stdev / avg_interval  # coefficient of variation
+
+            if cov <= max_jitter_cov:
+                existing_alert = db.query(models.Alert).filter(
+                    models.Alert.rule_name == "Beaconing Detected",
+                    models.Alert.src_ip == src_ip,
+                    models.Alert.dst_ip == dst_ip,
+                    models.Alert.timestamp >= current_time - timedelta(seconds=time_window_seconds),
+                ).first()
+
+                if not existing_alert:
+                    evidence = {
+                        "connection_count": len(window_ts),
+                        "intervals_seconds": [round(iv, 2) for iv in intervals],
+                        "avg_interval_seconds": round(avg_interval, 2),
+                        "interval_cov": round(cov, 4),
+                        "time_window": time_window_seconds,
+                    }
+                    alert_schema = schemas.AlertCreate(
+                        timestamp=current_time,
+                        rule_name="Beaconing Detected",
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        description=(
+                            f"Source {src_ip} exhibits beaconing to {dst_ip}: "
+                            f"{len(window_ts)} connections with avg interval "
+                            f"{round(avg_interval, 1)}s (CoV={round(cov, 3)})."
+                        ),
+                        evidence=json.dumps(evidence),
+                    )
+                    db_alert = models.Alert(**alert_schema.model_dump())
+                    db.add(db_alert)
+                    db.commit()
+                    alerts_created += 1
+
+                # Advance past this window to avoid duplicate alerts
+                window_start = i + 1
+
+    return alerts_created
