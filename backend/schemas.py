@@ -39,3 +39,16 @@ class SSLEventCreate(BaseModel):
     server_name: Optional[str] = None
     version: Optional[str] = None
     cipher: Optional[str] = None
+
+class AlertCreate(BaseModel):
+    timestamp: datetime
+    rule_name: str
+    src_ip: str
+    dst_ip: str
+    description: str
+    evidence: str
+
+class AlertResponse(AlertCreate):
+    id: int
+    class Config:
+        from_attributes = True

@@ -50,3 +50,15 @@ class SSLEvent(Base):
     server_name = Column(String, index=True, nullable=True)
     version = Column(String, nullable=True)
     cipher = Column(String, nullable=True)
+
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, index=True)
+    rule_name = Column(String, index=True)
+    src_ip = Column(String, index=True)
+    dst_ip = Column(String, index=True)
+    description = Column(String)
+    evidence = Column(String)
+

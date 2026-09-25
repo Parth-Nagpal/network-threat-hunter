@@ -85,3 +85,16 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
     finally:
         # Cleanup
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+from detection.scanner import detect_port_scan
+
+@app.post("/api/detect/portscan")
+def run_port_scan_detection(time_window: int = 60, threshold: int = 10, db: Session = Depends(get_db)):
+    """
+    Run port scan detection on the current connection events.
+    """
+    try:
+        alerts_created = detect_port_scan(db, time_window, threshold)
+        return {"status": "success", "alerts_created": alerts_created}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
