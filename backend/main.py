@@ -1,6 +1,8 @@
 import os
 import shutil
 import tempfile
+import json
+from datetime import datetime
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -112,6 +114,128 @@ async def ingest_pcap(file: UploadFile = File(...), db: Session = Depends(get_db
 
 from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh_brute_force, detect_dns_anomaly, detect_beaconing
 from schemas import AlertResponse, AlertStatusUpdate
+
+
+@app.get("/api/hunt")
+def hunt_telemetry(
+    source_ip: str | None = None,
+    destination_ip: str | None = None,
+    source_port: int | None = Query(default=None, ge=0, le=65535),
+    destination_port: int | None = Query(default=None, ge=0, le=65535),
+    protocol: str | None = None,
+    timestamp_from: datetime | None = None,
+    timestamp_to: datetime | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Search normalized telemetry across connection, DNS, HTTP, and TLS events."""
+    event_sources = [
+        (models.ConnectionEvent, "connection", models.ConnectionEvent.dst_ip, models.ConnectionEvent.protocol),
+        (models.DNSEvent, "dns", models.DNSEvent.dst_dns_server, None),
+        (models.HTTPEvent, "http", models.HTTPEvent.dst_ip, None),
+        (models.SSLEvent, "tls", models.SSLEvent.dst_ip, None),
+    ]
+    results = []
+    for model, event_type, destination_column, protocol_column in event_sources:
+        # Non-connection event models do not contain port data, so they cannot
+        # match a port-constrained search.
+        if (source_port is not None or destination_port is not None) and model is not models.ConnectionEvent:
+            continue
+        if protocol is not None:
+            if protocol_column is None:
+                if protocol.lower() != event_type:
+                    continue
+            else:
+                # The protocol predicate remains in SQL for connection records.
+                pass
+
+        query = db.query(model)
+        if source_ip is not None:
+            query = query.filter(model.src_ip == source_ip)
+        if destination_ip is not None:
+            query = query.filter(destination_column == destination_ip)
+        if model is models.ConnectionEvent:
+            if source_port is not None:
+                query = query.filter(model.src_port == source_port)
+            if destination_port is not None:
+                query = query.filter(model.dst_port == destination_port)
+            if protocol is not None:
+                query = query.filter(model.protocol == protocol)
+        if timestamp_from is not None:
+            query = query.filter(model.timestamp >= timestamp_from)
+        if timestamp_to is not None:
+            query = query.filter(model.timestamp <= timestamp_to)
+
+        rows = query.order_by(model.timestamp.desc(), model.id.desc()).limit(limit).all()
+        for row in rows:
+            if model is models.ConnectionEvent:
+                source_port_value, destination_port_value = row.src_port, row.dst_port
+                event_protocol = row.protocol
+                details = {
+                    "connection_state": row.connection_state,
+                    "duration": row.duration,
+                    "bytes_sent": row.bytes_sent,
+                    "bytes_received": row.bytes_received,
+                }
+            elif model is models.DNSEvent:
+                source_port_value = destination_port_value = None
+                event_protocol = "dns"
+                details = {
+                    "queried_domain": row.queried_domain,
+                    "query_type": row.query_type,
+                    "response_code": row.response_code,
+                }
+            elif model is models.HTTPEvent:
+                source_port_value = destination_port_value = None
+                event_protocol = "http"
+                details = {
+                    "method": row.method,
+                    "host": row.host,
+                    "uri": row.uri,
+                    "status_code": row.status_code,
+                    "user_agent": row.user_agent,
+                }
+            else:
+                source_port_value = destination_port_value = None
+                event_protocol = "tls"
+                details = {"server_name": row.server_name, "version": row.version, "cipher": row.cipher}
+
+            results.append({
+                "id": row.id,
+                "event_type": event_type,
+                "timestamp": row.timestamp,
+                "source_ip": row.src_ip,
+                "destination_ip": getattr(row, "dst_ip", getattr(row, "dst_dns_server", None)),
+                "source_port": source_port_value,
+                "destination_port": destination_port_value,
+                "protocol": event_protocol,
+                "details": details,
+            })
+
+    results.sort(key=lambda event: (event["timestamp"], event["id"]), reverse=True)
+    return results[:limit]
+
+
+@app.get("/api/hunt/alerts/{alert_id}")
+def get_hunt_alert_evidence(alert_id: int, db: Session = Depends(get_db)):
+    """Return the evidence recorded on an alert; detections do not store event IDs."""
+    alert = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    try:
+        evidence_metadata = json.loads(alert.evidence) if alert.evidence else None
+    except (TypeError, json.JSONDecodeError):
+        evidence_metadata = None
+    return {
+        "alert_id": alert.id,
+        "rule_name": alert.rule_name,
+        "timestamp": alert.timestamp,
+        "source_ip": alert.src_ip,
+        "destination_ip": alert.dst_ip,
+        "description": alert.description,
+        "evidence": alert.evidence,
+        "evidence_metadata": evidence_metadata,
+    }
 
 
 @app.get("/api/alerts", response_model=list[AlertResponse])
