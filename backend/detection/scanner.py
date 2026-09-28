@@ -63,7 +63,8 @@ def detect_port_scan(db: Session, time_window_seconds: int = 60, threshold: int 
                         description=f"Source {src_ip} scanned {len(seen_ports)} distinct ports on {dst_ip} within {time_window_seconds} seconds.",
                         evidence=json.dumps(evidence)
                     )
-                    db_alert = models.Alert(**alert_schema.model_dump())
+                    severity = "critical" if len(seen_ports) >= threshold * 2 else "high"
+                    db_alert = models.Alert(**alert_schema.model_dump(), severity=severity)
                     db.add(db_alert)
                     db.commit()
                     alerts_created += 1
@@ -136,7 +137,8 @@ def detect_network_sweep(db: Session, time_window_seconds: int = 60, threshold: 
                         ),
                         evidence=json.dumps(evidence)
                     )
-                    db_alert = models.Alert(**alert_schema.model_dump())
+                    severity = "critical" if len(seen_ips) >= threshold * 2 else "high"
+                    db_alert = models.Alert(**alert_schema.model_dump(), severity=severity)
                     db.add(db_alert)
                     db.commit()
                     alerts_created += 1
@@ -240,7 +242,8 @@ def detect_ssh_brute_force(
                         description=desc,
                         evidence=json.dumps(evidence),
                     )
-                    db_alert = models.Alert(**alert_schema.model_dump())
+                    severity = "critical" if len(failed) >= threshold * 2 else "high"
+                    db_alert = models.Alert(**alert_schema.model_dump(), severity=severity)
                     db.add(db_alert)
                     db.commit()
                     alerts_created += 1
@@ -341,7 +344,7 @@ def detect_dns_anomaly(
                         description=desc,
                         evidence=json.dumps(evidence),
                     )
-                    db_alert = models.Alert(**alert_schema.model_dump())
+                    db_alert = models.Alert(**alert_schema.model_dump(), severity="medium")
                     db.add(db_alert)
                     db.commit()
                     alerts_created += 1
@@ -453,7 +456,7 @@ def detect_beaconing(
                         ),
                         evidence=json.dumps(evidence),
                     )
-                    db_alert = models.Alert(**alert_schema.model_dump())
+                    db_alert = models.Alert(**alert_schema.model_dump(), severity="medium")
                     db.add(db_alert)
                     db.commit()
                     alerts_created += 1

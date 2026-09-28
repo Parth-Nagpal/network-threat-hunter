@@ -11,9 +11,13 @@ import {
   type Severity,
   type Technique,
   type TelemetryEvent,
+  type ReportPreview,
+  type ReportRequest,
+  type ReportIncidentRecord,
 } from './api'
 
-type Page = 'Dashboard' | 'Alerts' | 'Threat Hunting' | 'Attack Lab' | 'Incidents' | 'Investigation' | 'MITRE ATT&CK' | 'Hosts' | 'Reports'
+type Page = 'Dashboard' | 'Alerts' | 'Threat Hunting' | 'Attack Lab' | 'Incidents' | 'Investigation' | 'MITRE ATT&CK' | 'Hosts' | 'Reports' | 'Settings'
+type Theme = 'dark' | 'light'
 const NAV: { name: Page; icon: string; section: string }[] = [
   { name: 'Dashboard', icon: '▦', section: 'WORKSPACE' },
   { name: 'Alerts', icon: '◈', section: 'WORKSPACE' },
@@ -24,12 +28,21 @@ const NAV: { name: Page; icon: string; section: string }[] = [
   { name: 'MITRE ATT&CK', icon: '▧', section: 'INTELLIGENCE' },
   { name: 'Hosts', icon: '▤', section: 'INTELLIGENCE' },
   { name: 'Reports', icon: '▥', section: 'INTELLIGENCE' },
+  { name: 'Settings', icon: '⚙', section: 'SYSTEM' },
 ]
 
 function formatTime(value?: string) {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function parseAlertTimestamp(value: string) {
+  // API timestamps without an explicit offset represent database UTC values.
+  // Offset-aware values retain their supplied instant before local rendering.
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
+  const date = new Date(hasOffset ? value : `${value}Z`)
+  return Number.isFinite(date.getTime()) ? date : null
 }
 
 function badgeClass(value?: string) {
@@ -62,6 +75,110 @@ function Evidence({ value }: { value?: string }) {
   catch { return <pre className="evidence-block">{value}</pre> }
 }
 
+const ALERT_SERIES = [
+  { key: 'critical', label: 'Critical', color: '#c96b70' },
+  { key: 'high', label: 'High', color: '#d18a50' },
+  { key: 'medium', label: 'Medium', color: '#c7a653' },
+  { key: 'low', label: 'Low', color: '#8878e8' },
+] as const
+
+function AlertsOverTime({ alerts }: { alerts: Alert[] }) {
+  const points = alerts.flatMap((alert) => {
+    if (typeof alert.timestamp !== 'string' || !alert.timestamp.trim()) return []
+    const date = parseAlertTimestamp(alert.timestamp)
+    return date ? [{ alert, time: date.getTime() }] : []
+  }).sort((left, right) => left.time - right.time)
+  if (!points.length) return <div className="chart-empty">No alert timestamps are available for this chart.</div>
+
+  const earliest = points[0].time
+  const latest = points[points.length - 1].time
+  const span = latest - earliest
+  const hour = 60 * 60 * 1000
+  const day = 24 * hour
+  const bucketSize = span <= 6 * hour ? hour : span <= 48 * hour ? 3 * hour : span <= 14 * day ? day : 7 * day
+  const bucketKind = bucketSize === hour ? 'hour' : bucketSize === 3 * hour ? 'three-hour' : bucketSize === day ? 'day' : 'week'
+  const bucketStart = (timestamp: number) => {
+    const date = new Date(timestamp)
+    if (bucketKind === 'hour') date.setMinutes(0, 0, 0)
+    else if (bucketKind === 'three-hour') date.setHours(Math.floor(date.getHours() / 3) * 3, 0, 0, 0)
+    else if (bucketKind === 'day') date.setHours(0, 0, 0, 0)
+    else {
+      date.setHours(0, 0, 0, 0)
+      date.setDate(date.getDate() - ((date.getDay() + 6) % 7))
+    }
+    return date.getTime()
+  }
+  const nextBucket = (timestamp: number) => {
+    const date = new Date(timestamp)
+    if (bucketKind === 'hour') date.setHours(date.getHours() + 1)
+    else if (bucketKind === 'three-hour') date.setHours(date.getHours() + 3)
+    else if (bucketKind === 'day') date.setDate(date.getDate() + 1)
+    else date.setDate(date.getDate() + 7)
+    return date.getTime()
+  }
+  const start = bucketStart(earliest)
+  const lastBucket = bucketStart(latest)
+  const bins: { time: number; critical: number; high: number; medium: number; low: number }[] = []
+  for (let time = start, count = 0; time <= lastBucket && count < 10000; time = nextBucket(time), count += 1) {
+    bins.push({ time, critical: 0, high: 0, medium: 0, low: 0 })
+  }
+  const binIndexes = new Map(bins.map((bin, index) => [bin.time, index]))
+  points.forEach(({ alert, time }) => {
+    const index = binIndexes.get(bucketStart(time))
+    const bin = index === undefined ? undefined : bins[index]
+    const series = ALERT_SERIES.find((item) => item.key === alert.severity)
+    if (bin && series) bin[series.key] += 1
+  })
+
+  const width = Math.max(920, bins.length * 38)
+  const height = 280
+  const pad = { top: 16, right: 18, bottom: 46, left: 42 }
+  const plotWidth = width - pad.left - pad.right
+  const plotHeight = height - pad.top - pad.bottom
+  const maxCount = Math.max(1, ...bins.map((bin) => bin.critical + bin.high + bin.medium + bin.low))
+  const barWidth = Math.min(24, Math.max(6, plotWidth / bins.length * 0.68))
+  const tickStep = Math.max(1, Math.ceil(bins.length / Math.floor(plotWidth / 110)))
+  const tickIndexes = bins.map((_, index) => index).filter((index) => index % tickStep === 0 || index === bins.length - 1)
+  const tickLabel = (value: number) => bucketSize < 24 * hour
+    ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : new Date(value).toLocaleDateString([], { month: 'short', day: 'numeric' })
+  const tooltipTime = (value: number) => new Date(value).toLocaleString([], {
+    day: '2-digit', month: 'short', hour: 'numeric', minute: '2-digit',
+  })
+
+  return <div className="alerts-chart-wrap">
+    <div className="alerts-chart-legend">{ALERT_SERIES.map((series) => <span key={series.key}><i style={{ backgroundColor: series.color }} />{series.label}</span>)}</div>
+    <svg className="alerts-chart" style={{ width: `max(100%, ${width}px)` }} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Stacked alerts over time by severity">
+      {[0, 0.33, 0.66, 1].map((fraction) => {
+        const y = pad.top + plotHeight * fraction
+        const value = Math.round(maxCount * (1 - fraction))
+        return <g key={fraction}><line x1={pad.left} x2={width - pad.right} y1={y} y2={y} className="chart-gridline" /><text x={pad.left - 9} y={y + 3} textAnchor="end" className="chart-axis-label">{value}</text></g>
+      })}
+      {bins.map((bin, index) => {
+        const x = pad.left + index * (plotWidth / bins.length) + (plotWidth / bins.length - barWidth) / 2
+        let cumulative = 0
+        return <g key={bin.time}>{ALERT_SERIES.map((series) => {
+          const count = bin[series.key]
+          if (!count) return null
+          const segmentHeight = (count / maxCount) * plotHeight
+          const y = pad.top + plotHeight - ((cumulative + count) / maxCount) * plotHeight
+          cumulative += count
+          const total = bin.critical + bin.high + bin.medium + bin.low
+          const tooltip = `${tooltipTime(bin.time)}\nCritical: ${bin.critical}\nHigh: ${bin.high}\nMedium: ${bin.medium}\nLow: ${bin.low}\nTotal: ${total}`
+          return <rect key={series.key} x={x} y={y} width={barWidth} height={Math.max(segmentHeight, 1)} fill={series.color} rx="1">
+            <title>{tooltip}</title>
+          </rect>
+        })}</g>
+      })}
+      {tickIndexes.map((index) => {
+        const x = pad.left + index * (plotWidth / bins.length) + plotWidth / bins.length / 2
+        return <text key={index} x={x} y={height - 14} textAnchor="middle" className="chart-axis-label">{tickLabel(bins[index].time)}</text>
+      })}
+    </svg>
+    <div className="chart-caption">{bucketSize === 7 * day ? 'Weekly' : bucketSize === day ? 'Daily' : bucketSize === hour ? 'Hourly' : `${bucketSize / hour}-hour`} buckets · based on available alert timestamps</div>
+  </div>
+}
+
 function DashboardPage() {
   const [alerts, setAlerts] = useState<Alert[]>([])
   const [incidents, setIncidents] = useState<Incident[]>([])
@@ -85,7 +202,6 @@ function DashboardPage() {
     medium: alerts.filter((item) => item.severity === 'medium').length,
     low: alerts.filter((item) => item.severity === 'low').length,
   }), [alerts])
-  const maxSeverity = Math.max(1, counts.critical, counts.high, counts.medium, counts.low)
   const activeIncidents = incidents.filter((item) => item.status === 'open' || item.status === 'investigating')
   return <>
     <div className="page-intro"><div><p className="eyebrow">OVERVIEW</p><h2>Security operations</h2><p className="muted">A live view of alert and incident data from your network sensor.</p></div><button className="button button-secondary" onClick={() => void load()}>↻ Refresh</button></div>
@@ -97,30 +213,24 @@ function DashboardPage() {
         <Metric title="Investigating" value={counts.investigating} hint="Alerts in active review" tone="blue" icon="⌕" />
         <Metric title="Active incidents" value={activeIncidents.length} hint="Open or investigating" tone="violet" icon="◎" />
       </div>
-      <div className="dashboard-grid">
-        <Panel title="Severity breakdown" subtitle="Across the alerts returned by the API">
-          <div className="severity-chart">
-            {(['critical', 'high', 'medium', 'low'] as const).map((severity) => <div className="severity-row" key={severity}>
-              <div className="severity-label"><Badge value={severity} /><span>{counts[severity]}</span></div>
-              <div className="bar-track"><div className={`bar-fill bar-${severity}`} style={{ width: `${counts[severity] / maxSeverity * 100}%` }} /></div>
-            </div>)}
-          </div>
-          <div className="panel-foot">Resolved alerts: <strong>{counts.resolved}</strong></div>
-        </Panel>
-        <Panel title="Active incidents" subtitle={`${activeIncidents.length} from the incidents API`} action={<span className="live-dot-label"><i /> LIVE DATA</span>}>
-          {activeIncidents.length === 0 ? <div className="empty-inline">No active incidents</div> : <div className="compact-list">
-            {activeIncidents.slice(0, 5).map((item) => <div className="compact-item" key={item.id}><div><strong>{item.title}</strong><small>INC-{item.id} · {formatTime(item.updated_at)}</small></div><Badge value={item.severity} /></div>)}
-          </div>}
-        </Panel>
-        <Panel title="Recent alerts" subtitle="Latest alert records" className="span-two">
+      <Panel title="Alerts Over Time" subtitle="Alert volume by severity from the alert timestamps">
+        {alerts.length ? <AlertsOverTime alerts={alerts} /> : <div className="chart-empty">No alerts are available for the selected data.</div>}
+      </Panel>
+      <div className="dashboard-grid dashboard-lower-grid">
+        <Panel title="Recent alerts" subtitle="Latest alert records">
           <AlertTable alerts={alerts.slice(0, 6)} />
         </Panel>
-        <Panel title="Recent detection activity" subtitle="Detection rules represented by recent alerts" className="span-two">
-          {alerts.length === 0 ? <div className="empty-inline">No alert activity has been recorded.</div> : <div className="activity-list">
+        <Panel title="Recent incidents" subtitle={`${activeIncidents.length} open or investigating`}>
+          {activeIncidents.length === 0 ? <div className="empty-inline">No active incidents</div> : <div className="compact-list">
+            {activeIncidents.slice(0, 6).map((item) => <div className="compact-item" key={item.id}><div><strong>{item.title}</strong><small>INC-{item.id} · {formatTime(item.updated_at)}</small></div><Badge value={item.severity} /></div>)}
+          </div>}
+        </Panel>
+        <Panel title="Recent detection activity" subtitle="Latest detection findings">
+          {alerts.length === 0 ? <div className="empty-inline">No detection activity has been recorded.</div> : <div className="activity-list">
             {alerts.slice(0, 6).map((alert) => <div className="activity-item" key={alert.id}><span className="activity-icon">⌁</span><div><strong>{alert.rule_name}</strong><small>{alert.src_ip} → {alert.dst_ip}</small></div><time>{formatTime(alert.timestamp)}</time></div>)}
           </div>}
         </Panel>
-      </div><p className="dashboard-footnote">Alert totals include all alert API pages. Active incident count is from the latest 500 incidents returned by the API.</p>
+      </div><p className="dashboard-footnote">Alert totals include all alert API pages. Recent incidents are from the latest 500 incidents returned by the API.</p>
     </>}
   </>
 }
@@ -428,12 +538,195 @@ function MitrePage() {
   </>
 }
 
+type RecentReport = Pick<ReportPreview, 'report_type' | 'generated_at' | 'record_count'>
+
+function ReportsPage() {
+  const [reportType, setReportType] = useState<ReportRequest['report_type']>('alerts')
+  const [alerts, setAlerts] = useState<Alert[]>([])
+  const [incidents, setIncidents] = useState<Incident[]>([])
+  const [severity, setSeverity] = useState('')
+  const [status, setStatus] = useState('')
+  const [alertType, setAlertType] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [selectedAlerts, setSelectedAlerts] = useState<number[]>([])
+  const [selectedIncidents, setSelectedIncidents] = useState<number[]>([])
+  const [selectedOnly, setSelectedOnly] = useState(false)
+  const [preview, setPreview] = useState<ReportPreview | null>(null)
+  const [previewRequest, setPreviewRequest] = useState<ReportRequest | null>(null)
+  const [recent, setRecent] = useState<RecentReport[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(window.localStorage.getItem('threat-hunter-recent-reports') || '[]')
+      return Array.isArray(saved) ? saved.slice(0, 8) as RecentReport[] : []
+    } catch { return [] }
+  })
+  const [loading, setLoading] = useState(true)
+  const [generating, setGenerating] = useState(false)
+  const [downloading, setDownloading] = useState<'pdf' | 'docx' | null>(null)
+  const [error, setError] = useState('')
+  const [downloadError, setDownloadError] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true); setError('')
+    try {
+      const [alertRows, incidentRows] = await Promise.all([api.allAlerts(), api.incidents(500)])
+      setAlerts(alertRows); setIncidents(incidentRows)
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load report data') }
+    finally { setLoading(false) }
+  }, [])
+  useEffect(() => { void load() }, [load])
+
+  const alertTypes = useMemo(() => [...new Set(alerts.map((alert) => alert.alert_type))].sort(), [alerts])
+  const visibleAlerts = useMemo(() => alerts.filter((alert) => {
+    if (severity && alert.severity !== severity) return false
+    if (status && alert.status !== status) return false
+    if (alertType && alert.alert_type !== alertType) return false
+    const timestamp = new Date(alert.timestamp).getTime()
+    if (dateFrom && (!Number.isFinite(timestamp) || timestamp < new Date(`${dateFrom}T00:00:00`).getTime())) return false
+    if (dateTo && (!Number.isFinite(timestamp) || timestamp > new Date(`${dateTo}T23:59:59`).getTime())) return false
+    return true
+  }), [alerts, severity, status, alertType, dateFrom, dateTo])
+  const visibleIncidents = useMemo(() => incidents.filter((incident) => {
+    if (severity && incident.severity !== severity) return false
+    if (status && incident.status !== status) return false
+    const timestamp = new Date(incident.created_at).getTime()
+    if (dateFrom && (!Number.isFinite(timestamp) || timestamp < new Date(`${dateFrom}T00:00:00`).getTime())) return false
+    if (dateTo && (!Number.isFinite(timestamp) || timestamp > new Date(`${dateTo}T23:59:59`).getTime())) return false
+    return true
+  }), [incidents, severity, status, dateFrom, dateTo])
+  const visibleIds = reportType === 'alerts' ? visibleAlerts.map((alert) => alert.id) : visibleIncidents.map((incident) => incident.id)
+  const currentSelection = reportType === 'alerts' ? selectedAlerts : selectedIncidents
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => currentSelection.includes(id))
+
+  function buildPayload(): ReportRequest {
+    const payload: ReportRequest = { report_type: reportType }
+    if (severity) payload.severity = severity
+    if (status) payload.status = status as AlertStatus
+    if (dateFrom) payload.timestamp_from = new Date(`${dateFrom}T00:00:00`).toISOString()
+    if (dateTo) payload.timestamp_to = new Date(`${dateTo}T23:59:59.999`).toISOString()
+    if (reportType === 'alerts') {
+      if (alertType) payload.alert_type = alertType
+      if (selectedOnly) payload.alert_ids = selectedAlerts
+    } else if (selectedOnly) payload.incident_ids = selectedIncidents
+    return payload
+  }
+
+  async function generate() {
+    const payload = buildPayload()
+    setGenerating(true); setError(''); setDownloadError('')
+    try {
+      const result = await api.reportPreview(payload)
+      setPreview(result); setPreviewRequest(payload)
+      const next = [{ report_type: result.report_type, generated_at: result.generated_at, record_count: result.record_count }, ...recent].slice(0, 8)
+      setRecent(next)
+      window.localStorage.setItem('threat-hunter-recent-reports', JSON.stringify(next))
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to generate report') }
+    finally { setGenerating(false) }
+  }
+
+  async function download(format: 'pdf' | 'docx') {
+    if (!previewRequest) return
+    setDownloading(format); setDownloadError('')
+    try {
+      const file = await api.exportReport(previewRequest, format)
+      const href = URL.createObjectURL(file.blob)
+      const link = document.createElement('a')
+      link.href = href; link.download = file.filename
+      document.body.appendChild(link); link.click(); link.remove()
+      URL.revokeObjectURL(href)
+    } catch (cause) { setDownloadError(cause instanceof Error ? cause.message : `Unable to export ${format.toUpperCase()}`) }
+    finally { setDownloading(null) }
+  }
+
+  function toggleVisible(checked: boolean) {
+    const update = (current: number[]) => checked
+      ? [...new Set([...current, ...visibleIds])]
+      : current.filter((id) => !visibleIds.includes(id))
+    if (reportType === 'alerts') setSelectedAlerts(update)
+    else setSelectedIncidents(update)
+  }
+
+  function toggleRecord(id: number, checked: boolean) {
+    const update = (current: number[]) => checked ? [...new Set([...current, id])] : current.filter((item) => item !== id)
+    if (reportType === 'alerts') setSelectedAlerts(update)
+    else setSelectedIncidents(update)
+  }
+
+  return <>
+    <div className="page-intro"><div><p className="eyebrow">REPORTING</p><h2>Security Reports</h2><p className="muted">Build analyst-ready reports from stored alerts and incident investigation data.</p></div><button className="button button-secondary" onClick={() => void load()} disabled={loading}>↻ Refresh data</button></div>
+    {error && <StateMessage error={error} onRetry={() => void load()} />}
+    <Panel title="Configure report" subtitle={loading ? 'Loading data from the backend…' : `${alerts.length} alerts and ${incidents.length} incidents available from the backend`}>
+      <div className="report-type-switch" role="group" aria-label="Report type">
+        {(['alerts', 'incidents'] as const).map((type) => <button key={type} className={`report-type-option ${reportType === type ? 'report-type-active' : ''}`} aria-pressed={reportType === type} onClick={() => setReportType(type)}><span>{type === 'alerts' ? '◈' : '◎'}</span><strong>{type === 'alerts' ? 'Alert Report' : 'Incident Report'}</strong><small>{type === 'alerts' ? 'Detections, statuses and evidence' : 'Cases, timeline and investigation records'}</small></button>)}
+      </div>
+      <div className="report-controls">
+        <label>From<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label>
+        <label>To<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label>
+        <label>Severity<select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="">All severities</option>{['critical', 'high', 'medium', 'low'].map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        <label>Status<select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All statuses</option>{['open', 'investigating', 'resolved', 'false_positive'].map((item) => <option key={item} value={item}>{item.replaceAll('_', ' ')}</option>)}</select></label>
+        {reportType === 'alerts' && <label>Detection type<select value={alertType} onChange={(event) => setAlertType(event.target.value)}><option value="">All types</option>{alertTypes.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>}
+        <label>Include<select value={selectedOnly ? 'selected' : 'matching'} onChange={(event) => setSelectedOnly(event.target.value === 'selected')}><option value="matching">All matching records</option><option value="selected">Selected records only</option></select></label>
+      </div>
+      <div className="report-selection-heading"><div><strong>{reportType === 'alerts' ? 'Alerts' : 'Incidents'} to include</strong><small>{selectedOnly ? `${currentSelection.length} selected` : 'Select individual rows or include all matching records'}</small></div><button type="button" className="text-button" onClick={() => toggleVisible(!allVisibleSelected)} disabled={loading || visibleIds.length === 0}>{allVisibleSelected ? 'Clear visible selection' : 'Select visible'}</button></div>
+      <div className="table-scroll report-record-list"><table><thead><tr><th><input type="checkbox" aria-label="Select all visible records" checked={allVisibleSelected} onChange={(event) => toggleVisible(event.target.checked)} disabled={visibleIds.length === 0} /></th><th>{reportType === 'alerts' ? 'Detection' : 'Incident'}</th><th>Severity</th><th>Status</th><th>{reportType === 'alerts' ? 'Source → destination' : 'Updated'}</th><th>Timestamp</th></tr></thead><tbody>
+        {reportType === 'alerts' ? visibleAlerts.map((alert) => <tr key={alert.id}><td><input type="checkbox" aria-label={`Select alert ${alert.id}`} checked={selectedAlerts.includes(alert.id)} onChange={(event) => toggleRecord(alert.id, event.target.checked)} /></td><td><strong>{alert.rule_name}</strong><small className="cell-sub">ALT-{alert.id} · {alert.alert_type}</small></td><td><Badge value={alert.severity} /></td><td><Badge value={alert.status} /></td><td className="mono">{alert.src_ip} → {alert.dst_ip}</td><td>{formatTime(alert.timestamp)}</td></tr>) : visibleIncidents.map((incident) => <tr key={incident.id}><td><input type="checkbox" aria-label={`Select incident ${incident.id}`} checked={selectedIncidents.includes(incident.id)} onChange={(event) => toggleRecord(incident.id, event.target.checked)} /></td><td><strong>{incident.title}</strong><small className="cell-sub">INC-{incident.id}</small></td><td><Badge value={incident.severity} /></td><td><Badge value={incident.status} /></td><td>{formatTime(incident.updated_at)}</td><td>{formatTime(incident.created_at)}</td></tr>)}
+        {!loading && visibleIds.length === 0 && <tr><td colSpan={6} className="report-empty-cell">No records match these filters.</td></tr>}
+      </tbody></table></div>
+      <div className="report-generate-row"><span>{visibleIds.length} matching {reportType} · reports include data available when generated</span><button className="button button-primary" onClick={() => void generate()} disabled={loading || generating}>{generating ? 'Generating…' : 'Generate report'}</button></div>
+    </Panel>
+
+    {preview && <Panel title={`${preview.title} preview`} subtitle={`${preview.summary} · Generated ${formatTime(preview.generated_at)}`} action={<div className="report-export-actions"><button className="button button-secondary" onClick={() => void download('pdf')} disabled={downloading !== null}>{downloading === 'pdf' ? 'Preparing PDF…' : 'Export PDF'}</button><button className="button button-primary" onClick={() => void download('docx')} disabled={downloading !== null}>{downloading === 'docx' ? 'Preparing Word…' : 'Export Word'}</button></div>}>
+      {downloadError && <div className="report-download-error">{downloadError}</div>}
+      <div className="report-preview-summary"><div><small>REPORT SUMMARY</small><strong>{preview.record_count} {preview.report_type}</strong><span>{preview.summary}</span></div>{preview.report_type === 'alerts' && <><div><small>SEVERITY BREAKDOWN</small><div className="report-breakdown">{Object.entries(preview.severity_breakdown || {}).map(([key, count]) => <span key={key}><Badge value={key} /> <strong>{count}</strong></span>)}</div></div><div><small>DETECTION TYPES</small><div className="report-breakdown">{Object.entries(preview.alert_types || {}).map(([key, count]) => <span key={key}>{key} <strong>{count}</strong></span>)}</div></div></>}</div>
+      {preview.report_type === 'alerts' ? <div className="report-preview-list">{(preview.alerts || []).map((alert) => <article className="report-alert" key={alert.id}><div className="report-alert-heading"><div><strong>ALT-{alert.id} · {alert.rule_name}</strong><small>{formatTime(alert.timestamp)} · {alert.source_ip} → {alert.destination_ip}</small></div><div><Badge value={alert.severity} /> <Badge value={alert.status} /></div></div><p>{alert.description || 'No description recorded.'}</p><details><summary>Recorded evidence</summary><Evidence value={alert.evidence} /></details></article>)}{!preview.record_count && <div className="empty-inline">No alerts matched the report selection.</div>}</div> : <div className="report-preview-list">{(preview.incidents || []).map((incident) => <IncidentReportPreview key={incident.id} incident={incident} />)}{!preview.record_count && <div className="empty-inline">No incidents matched the report selection.</div>}</div>}
+    </Panel>}
+
+    <Panel title="Recent reports" subtitle="Recently generated report previews on this device">
+      {recent.length ? <div className="table-scroll"><table><thead><tr><th>Report</th><th>Records</th><th>Generated</th><th>Available</th></tr></thead><tbody>{recent.map((item, index) => <tr key={`${item.generated_at}-${index}`}><td><strong>{item.report_type === 'alerts' ? 'Alert Report' : 'Incident Report'}</strong></td><td>{item.record_count}</td><td>{formatTime(item.generated_at)}</td><td><span className="report-preview-state">Preview · export above</span></td></tr>)}</tbody></table></div> : <div className="empty-inline">Generated report previews will appear here.</div>}
+    </Panel>
+  </>
+}
+
+function IncidentReportPreview({ incident }: { incident: ReportIncidentRecord }) {
+  return <article className="report-incident">
+    <div className="report-incident-heading"><div><strong>INC-{incident.id} · {incident.title}</strong><p>{incident.summary || 'No summary recorded.'}</p></div><div><Badge value={incident.severity} /> <Badge value={incident.status} /></div></div>
+    <div className="report-incident-meta"><span>Created <strong>{formatTime(incident.created_at)}</strong></span><span>Updated <strong>{formatTime(incident.updated_at)}</strong></span><span>{incident.alerts.length} associated alerts</span></div>
+    <h3>Chronological alert timeline</h3>
+    {incident.timeline.length ? <div className="table-scroll"><table><thead><tr><th>Timestamp</th><th>Rule / type</th><th>Severity</th><th>Source</th><th>Destination</th></tr></thead><tbody>{incident.timeline.map((item, index) => <tr key={`${item.timestamp}-${index}`}><td>{formatTime(item.timestamp)}</td><td><strong>{item.rule_name}</strong><small className="cell-sub">{item.type}</small></td><td><Badge value={item.severity} /></td><td className="mono">{item.source_ip}</td><td className="mono">{item.destination_ip}</td></tr>)}</tbody></table></div> : <p className="muted report-no-data">No associated alerts.</p>}
+    <h3>Related telemetry</h3>
+    {incident.related_telemetry.length ? <div className="table-scroll"><table><thead><tr><th>Timestamp</th><th>Event</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Details</th></tr></thead><tbody>{incident.related_telemetry.map((event) => <tr key={`${event.event_type}-${event.id}`}><td>{formatTime(event.timestamp)}</td><td>{event.event_type}{event.is_simulated ? <span className="simulation-tag">SIM</span> : null}</td><td className="mono">{event.source_ip}{event.source_port ? `:${event.source_port}` : ''}</td><td className="mono">{event.destination_ip}{event.destination_port ? `:${event.destination_port}` : ''}</td><td>{event.protocol}</td><td className="truncate">{Object.entries(event.details).map(([key, value]) => `${key}: ${String(value)}`).join(' · ') || '—'}</td></tr>)}</tbody></table></div> : <p className="muted report-no-data">No related telemetry was found for the investigation window.</p>}
+    <div className="report-detail-columns"><section><h3>Indicators of compromise</h3>{[
+      ['IP addresses', incident.iocs.ip_addresses], ['Domains', incident.iocs.domains], ['URLs', incident.iocs.urls], ['Destination ports', incident.iocs.destination_ports],
+    ].map(([label, values]) => <div className="report-ioc-row" key={String(label)}><strong>{String(label)}</strong><span>{(values as (string | number)[]).join(', ') || 'None recorded'}</span></div>)}</section><section><h3>MITRE ATT&amp;CK</h3>{incident.mitre_techniques.length ? incident.mitre_techniques.map((technique) => <div className="report-plain-item" key={technique.technique_id}><strong>{technique.technique_id} · {technique.name}</strong><small>{technique.tactic} · {technique.source_detection_type}</small></div>) : <p className="muted">No techniques associated.</p>}</section></div>
+    <div className="report-detail-columns"><section><h3>Investigation notes</h3>{incident.notes.length ? incident.notes.map((note) => <div className="report-plain-item" key={note.id}><span>{note.content}</span><small>{formatTime(note.created_at)}</small></div>) : <p className="muted">No analyst notes recorded.</p>}</section><section><h3>Investigation actions</h3>{incident.actions.length ? incident.actions.map((action) => <div className="report-plain-item" key={action.id}><strong>{action.action_type.replaceAll('_', ' ')}</strong><span>{action.comment || 'No comment'}</span><small>{formatTime(action.created_at)}</small></div>) : <p className="muted">No investigation actions recorded.</p>}</section></div>
+    <details className="report-associated-alerts"><summary>Associated alerts and recorded evidence</summary>{incident.alerts.map((alert) => <div className="report-alert" key={alert.id}><div className="report-alert-heading"><div><strong>ALT-{alert.id} · {alert.rule_name}</strong><small>{formatTime(alert.timestamp)} · {alert.source_ip} → {alert.destination_ip}</small></div><div><Badge value={alert.severity} /> <Badge value={alert.status} /></div></div><p>{alert.description || 'No description recorded.'}</p><Evidence value={alert.evidence} /></div>)}</details>
+  </article>
+}
+
+function SettingsPage({ theme, onThemeChange }: { theme: Theme; onThemeChange: (theme: Theme) => void }) {
+  return <>
+    <div className="page-intro"><div><p className="eyebrow">PREFERENCES</p><h2>Settings</h2><p className="muted">Adjust the appearance of this analyst workspace.</p></div></div>
+    <Panel title="Appearance" subtitle="Choose the theme for this browser">
+      <div className="appearance-setting"><div><strong>Theme</strong><small>The selection is saved on this device.</small></div>
+        <div className="theme-options" role="group" aria-label="Appearance theme">
+          {(['dark', 'light'] as const).map((choice) => <button key={choice} className={`theme-option ${theme === choice ? 'theme-option-selected' : ''}`} aria-pressed={theme === choice} onClick={() => onThemeChange(choice)}><span className={`theme-preview theme-preview-${choice}`} /><span>{choice === 'dark' ? 'Dark' : 'Light'}</span></button>)}
+        </div>
+      </div>
+    </Panel>
+  </>
+}
+
 function PlaceholderPage({ title }: { title: string }) {
   return <div className="placeholder-page"><div className="placeholder-icon">⌁</div><p className="eyebrow">NOT AVAILABLE</p><h2>{title}</h2><p>This workspace is reserved for {title.toLowerCase()} data. The current backend does not expose a supporting API yet.</p><span className="placeholder-tag">Backend integration pending</span></div>
 }
 
 function App() {
   const [page, setPage] = useState<Page>('Dashboard')
+  const [theme, setTheme] = useState<Theme>(() => {
+    const savedTheme = window.localStorage.getItem('threat-hunter-theme')
+    if (savedTheme === 'dark' || savedTheme === 'light') return savedTheme
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  })
   const [investigateIncidentId, setInvestigateIncidentId] = useState<number | null>(null)
   const [health, setHealth] = useState<'healthy' | 'unhealthy' | 'loading'>('loading')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
@@ -444,18 +737,22 @@ function App() {
     catch (cause) { setHealth('unhealthy'); setHealthError(cause instanceof Error ? cause.message : 'API unavailable') }
   }, [])
   useEffect(() => { void refreshHealth() }, [refreshHealth])
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    window.localStorage.setItem('threat-hunter-theme', theme)
+  }, [theme])
   function navigate(next: Page) { setPage(next); setMobileNavOpen(false) }
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNavOpen ? 'sidebar-open' : ''}`}>
       <div className="brand"><div className="brand-mark"><span>TH</span><i /></div><div><strong>THREAT<span>HUNTER</span></strong><small>NETWORK DEFENSE</small></div></div>
       <div className="sensor-card"><span className={`sensor-indicator ${health}`} /><div><strong>Network sensor</strong><small>{health === 'loading' ? 'Checking connection' : health === 'healthy' ? 'API connected' : 'API unavailable'}</small></div><button className="mini-refresh" aria-label="Refresh API health" onClick={() => void refreshHealth()}>↻</button></div>
-      {['WORKSPACE', 'RESPONSE', 'INTELLIGENCE'].map((section) => <div className="nav-section" key={section}><p>{section}</p>{NAV.filter((item) => item.section === section).map((item) => <button key={item.name} className={`nav-item ${page === item.name ? 'nav-active' : ''}`} onClick={() => navigate(item.name)}><span className="nav-icon">{item.icon}</span><span>{item.name}</span></button>)}</div>)}
+      {['WORKSPACE', 'RESPONSE', 'INTELLIGENCE', 'SYSTEM'].map((section) => <div className="nav-section" key={section}><p>{section}</p>{NAV.filter((item) => item.section === section).map((item) => <button key={item.name} className={`nav-item ${page === item.name ? 'nav-active' : ''}`} onClick={() => navigate(item.name)}><span className="nav-icon">{item.icon}</span><span>{item.name}</span></button>)}</div>)}
       <div className="sidebar-footer"><div className="footer-avatar">SOC</div><div><strong>Analyst workspace</strong><small>Local deployment</small></div></div>
     </aside>
     {mobileNavOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
     <main className="main-area"><header className="topbar"><button className="mobile-menu" onClick={() => setMobileNavOpen(!mobileNavOpen)} aria-label="Toggle navigation">☰</button><div className="breadcrumb"><span>Network Threat Hunter</span><b>/</b><strong>{page}</strong></div><div className="topbar-right"><span className="utc-label">SOC CONSOLE</span><button className="top-health" onClick={() => void refreshHealth()}><i className={`sensor-indicator ${health}`} />{health === 'loading' ? 'Connecting' : health === 'healthy' ? 'System operational' : 'Backend offline'}</button></div></header>
       {healthError && <div className="global-api-error"><span>{healthError}</span><button onClick={() => void refreshHealth()}>Retry</button></div>}
-      <div className="page-content">{page === 'Dashboard' && <DashboardPage />}{page === 'Alerts' && <AlertsPage />}{page === 'Threat Hunting' && <HuntPage />}{page === 'Attack Lab' && <AttackLabPage onInvestigate={(id) => { setInvestigateIncidentId(id); navigate('Investigation') }} />}{page === 'Incidents' && <IncidentsPage />}{page === 'Investigation' && <InvestigationPage incidentId={investigateIncidentId} />}{page === 'MITRE ATT&CK' && <MitrePage />}{(page === 'Hosts' || page === 'Reports') && <PlaceholderPage title={page} />}</div>
+      <div className="page-content">{page === 'Dashboard' && <DashboardPage />}{page === 'Alerts' && <AlertsPage />}{page === 'Threat Hunting' && <HuntPage />}{page === 'Attack Lab' && <AttackLabPage onInvestigate={(id) => { setInvestigateIncidentId(id); navigate('Investigation') }} />}{page === 'Incidents' && <IncidentsPage />}{page === 'Investigation' && <InvestigationPage incidentId={investigateIncidentId} />}{page === 'MITRE ATT&CK' && <MitrePage />}{page === 'Reports' && <ReportsPage />}{page === 'Settings' && <SettingsPage theme={theme} onThemeChange={setTheme} />}{page === 'Hosts' && <PlaceholderPage title={page} />}</div>
       <footer className="app-footer"><span>NETWORK THREAT HUNTER <i>·</i> SOC WORKSPACE</span><span>DATA FROM CONFIGURED BACKEND APIS</span></footer>
     </main>
   </div>

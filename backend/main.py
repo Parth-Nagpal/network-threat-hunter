@@ -3,9 +3,10 @@ import shutil
 import tempfile
 import json
 import ipaddress
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text, or_
@@ -53,6 +54,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 @app.get("/health")
@@ -118,10 +120,12 @@ from detection.scanner import detect_port_scan, detect_network_sweep, detect_ssh
 from schemas import (
     AlertResponse, AlertStatusUpdate, IncidentCreate, IncidentUpdate,
     AnalystNoteCreate, InvestigationActionCreate, MitreTechniqueResponse,
+    ReportRequest,
 )
 from correlation import correlate_open_alerts
 from mitre import ALERT_TYPE_TO_TECHNIQUE, seed_mitre_techniques
 from lab import scenario_catalog, run_scenario, run_response
+from report_export import render_pdf, render_docx
 
 mitre_seed_session = SessionLocal()
 try:
@@ -628,6 +632,104 @@ def get_incident_investigation(
         "investigation_window": {"from": start_at, "to": end_at, "window_minutes": window_minutes},
     })
     return result
+
+
+def _report_bound(value):
+    if value is not None and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _build_report_data(payload: ReportRequest, db: Session):
+    generated_at = datetime.utcnow()
+    timestamp_from = _report_bound(payload.timestamp_from)
+    timestamp_to = _report_bound(payload.timestamp_to)
+    if payload.report_type == "alerts":
+        query = db.query(models.Alert)
+        if payload.alert_ids is not None:
+            query = query.filter(models.Alert.id.in_(payload.alert_ids))
+        if payload.severity:
+            query = query.filter(models.Alert.severity == payload.severity)
+        if payload.status:
+            query = query.filter(models.Alert.status == payload.status)
+        if payload.alert_type:
+            query = query.filter(models.Alert.alert_type == payload.alert_type)
+        if timestamp_from:
+            query = query.filter(models.Alert.timestamp >= timestamp_from)
+        if timestamp_to:
+            query = query.filter(models.Alert.timestamp <= timestamp_to)
+        alerts = query.order_by(models.Alert.timestamp.desc(), models.Alert.id.desc()).all()
+        severity_breakdown = {severity: 0 for severity in ("critical", "high", "medium", "low")}
+        alert_types = {}
+        for alert in alerts:
+            severity_breakdown[alert.severity] = severity_breakdown.get(alert.severity, 0) + 1
+            alert_types[alert.alert_type] = alert_types.get(alert.alert_type, 0) + 1
+        return {
+            "report_type": "alerts", "title": "Alert Report", "generated_at": generated_at,
+            "record_count": len(alerts),
+            "summary": f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''} {'match' if len(alerts) != 1 else 'matches'} the selected records and filters.",
+            "severity_breakdown": severity_breakdown, "alert_types": alert_types,
+            "alerts": [{
+                "id": alert.id, "timestamp": alert.timestamp, "rule_name": alert.rule_name,
+                "alert_type": alert.alert_type, "severity": alert.severity, "status": alert.status,
+                "source_ip": alert.src_ip, "destination_ip": alert.dst_ip,
+                "description": alert.description, "evidence": alert.evidence,
+            } for alert in alerts],
+        }
+
+    query = db.query(models.Incident)
+    if payload.incident_ids is not None:
+        query = query.filter(models.Incident.id.in_(payload.incident_ids))
+    if payload.severity:
+        query = query.filter(models.Incident.severity == payload.severity)
+    if payload.status:
+        query = query.filter(models.Incident.status == payload.status)
+    if timestamp_from:
+        query = query.filter(models.Incident.created_at >= timestamp_from)
+    if timestamp_to:
+        query = query.filter(models.Incident.created_at <= timestamp_to)
+    incidents = query.order_by(models.Incident.created_at.desc(), models.Incident.id.desc()).all()
+    details = []
+    for incident in incidents:
+        detail = get_incident_investigation(incident.id, window_minutes=10, limit=500, db=db)
+        alert_statuses = {
+            alert.id: alert.status
+            for alert in db.query(models.Alert).join(models.IncidentAlert).filter(
+                models.IncidentAlert.incident_id == incident.id
+            ).all()
+        }
+        detail["alerts"] = [dict(alert, status=alert_statuses.get(alert["id"], "unknown")) for alert in detail["alerts"]]
+        details.append(detail)
+    return {
+        "report_type": "incidents", "title": "Incident Report", "generated_at": generated_at,
+        "record_count": len(details),
+        "summary": f"{len(details)} incident{'s' if len(details) != 1 else ''} {'match' if len(details) != 1 else 'matches'} the selected records and filters.",
+        "incidents": details,
+    }
+
+
+@app.post("/api/reports/preview")
+def preview_report(payload: ReportRequest, db: Session = Depends(get_db)):
+    """Build report content from current stored alerts/incidents for review."""
+    if _report_bound(payload.timestamp_from) and _report_bound(payload.timestamp_to) and _report_bound(payload.timestamp_from) > _report_bound(payload.timestamp_to):
+        raise HTTPException(status_code=422, detail="timestamp_from must be before timestamp_to")
+    return _build_report_data(payload, db)
+
+
+@app.post("/api/reports/export/{file_format}")
+def export_report(file_format: str, payload: ReportRequest, db: Session = Depends(get_db)):
+    """Render a report from live database records and return it as a file download."""
+    if file_format not in {"pdf", "docx"}:
+        raise HTTPException(status_code=400, detail="Supported report formats are pdf and docx")
+    if _report_bound(payload.timestamp_from) and _report_bound(payload.timestamp_to) and _report_bound(payload.timestamp_from) > _report_bound(payload.timestamp_to):
+        raise HTTPException(status_code=422, detail="timestamp_from must be before timestamp_to")
+    report = _build_report_data(payload, db)
+    content = render_pdf(report) if file_format == "pdf" else render_docx(report)
+    media_type = "application/pdf" if file_format == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    filename = f"ThreatHunter_{report['report_type'].title()}_{datetime.utcnow():%Y%m%d_%H%M%S}.{file_format}"
+    return StreamingResponse(content, media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    })
 
 
 @app.post("/api/incidents/{incident_id}/notes")

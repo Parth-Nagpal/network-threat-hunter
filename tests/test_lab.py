@@ -1,5 +1,6 @@
 """Safe synthetic Attack Lab workflow tests."""
 from datetime import datetime
+import json
 import os
 import sys
 
@@ -59,18 +60,20 @@ def test_lab_lists_safe_scenarios(lab_client):
     assert response.status_code == 200
     scenarios = response.json()
     assert {item["id"] for item in scenarios} == {
-        "port-scan", "network-sweep", "ssh-brute-force", "beaconing"
+        "port-scan", "network-sweep", "ssh-brute-force", "beaconing",
+        "rare-destination", "minor-dns-anomaly", "dns-burst", "http-anomaly",
+        "service-probing", "lateral-movement", "large-outbound-transfer", "multi-stage-attack",
     }
     assert all("synthetic" in item["safety"].lower() for item in scenarios)
 
 
-@pytest.mark.parametrize("scenario_id,rule_name", [
-    ("port-scan", "Port Scan Detected"),
-    ("network-sweep", "Network Sweep Detected"),
-    ("ssh-brute-force", "SSH Brute Force Detected"),
-    ("beaconing", "Beaconing Detected"),
+@pytest.mark.parametrize("scenario_id,rule_name,severity", [
+    ("port-scan", "Port Scan Detected", "high"),
+    ("network-sweep", "Network Sweep Detected", "high"),
+    ("ssh-brute-force", "SSH Brute Force Detected", "high"),
+    ("beaconing", "Beaconing Detected", "medium"),
 ])
-def test_scenario_runs_detection_and_records_workflow(lab_client, run_and_cleanup, scenario_id, rule_name):
+def test_scenario_runs_detection_and_records_workflow(lab_client, run_and_cleanup, scenario_id, rule_name, severity):
     response = lab_client.post(f"/api/lab/scenarios/{scenario_id}/run")
     assert response.status_code == 200
     run = response.json()
@@ -81,6 +84,7 @@ def test_scenario_runs_detection_and_records_workflow(lab_client, run_and_cleanu
     assert run["generated_event_count"] == len(run["generated_telemetry"])
     assert all(event["is_simulated"] for event in run["generated_telemetry"])
     assert run["alerts"] and all(alert["rule_name"] == rule_name for alert in run["alerts"])
+    assert all(alert["severity"] == severity for alert in run["alerts"])
     assert run["incident_ids"] and run["incidents"]
     assert set(run["alert_ids"]).issubset({alert["id"] for alert in run["alerts"]})
 
@@ -91,6 +95,35 @@ def test_scenario_runs_detection_and_records_workflow(lab_client, run_and_cleanu
     assert detail.status_code == 200
     assert detail.json()["alert_ids"] == run["alert_ids"]
     assert detail.json()["incident_ids"] == run["incident_ids"]
+
+
+@pytest.mark.parametrize("scenario_id,expected_severity", [
+    ("rare-destination", "low"),
+    ("minor-dns-anomaly", "low"),
+    ("dns-burst", "medium"),
+    ("http-anomaly", "medium"),
+    ("service-probing", "high"),
+    ("lateral-movement", "high"),
+    ("large-outbound-transfer", "critical"),
+    ("multi-stage-attack", "critical"),
+])
+def test_new_scenarios_detect_behavior_at_expected_severity(lab_client, run_and_cleanup, scenario_id, expected_severity):
+    response = lab_client.post(f"/api/lab/scenarios/{scenario_id}/run")
+    assert response.status_code == 200
+    run = response.json()
+    run_and_cleanup.append(run["id"])
+    assert run["status"] == "completed"
+    assert run["generated_event_count"] == len(run["generated_telemetry"]) > 0
+    assert run["alerts"]
+    assert expected_severity in {alert["severity"] for alert in run["alerts"]}
+    if scenario_id == "multi-stage-attack":
+        assert run["incident_ids"]
+    assert all(event["is_simulated"] for event in run["generated_telemetry"])
+    if scenario_id == "multi-stage-attack":
+        chain = next(alert for alert in run["alerts"] if alert["rule_name"] == "Multi-Stage Attack Chain Detected")
+        assert [item["stage"] for item in json.loads(chain["evidence"])["stages"]] == [
+            "port_scan", "ssh_brute_force", "suspicious_communication",
+        ]
 
 
 def test_unknown_scenario_and_run_return_not_found(lab_client):

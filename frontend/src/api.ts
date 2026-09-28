@@ -130,6 +130,52 @@ export interface HuntFilters {
   limit?: string | number
 }
 
+export interface ReportRequest {
+  report_type: 'alerts' | 'incidents'
+  alert_ids?: number[]
+  incident_ids?: number[]
+  severity?: string
+  status?: AlertStatus
+  alert_type?: string
+  timestamp_from?: string
+  timestamp_to?: string
+}
+
+export interface ReportAlertRecord {
+  id: number
+  timestamp: string
+  rule_name: string
+  alert_type: string
+  severity: Severity
+  status: AlertStatus
+  source_ip: string
+  destination_ip: string
+  description: string
+  evidence: string
+}
+
+export interface ReportIncidentRecord extends Incident {
+  alerts: (IncidentAlert & { status: AlertStatus })[]
+  timeline: TimelineItem[]
+  related_telemetry: TelemetryEvent[]
+  iocs: IOCSet
+  mitre_techniques: Technique[]
+  notes: InvestigationNote[]
+  actions: InvestigationAction[]
+}
+
+export interface ReportPreview {
+  report_type: 'alerts' | 'incidents'
+  title: string
+  generated_at: string
+  record_count: number
+  summary: string
+  severity_breakdown?: Record<string, number>
+  alert_types?: Record<string, number>
+  alerts?: ReportAlertRecord[]
+  incidents?: ReportIncidentRecord[]
+}
+
 const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '')
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -215,4 +261,27 @@ export const api = {
     request<LabRun>(`/api/lab/scenarios/${encodeURIComponent(scenarioId)}/run`, { method: 'POST' }),
   labRuns: (limit = 100) => request<LabRun[]>(`/api/lab/runs?limit=${limit}`),
   labRun: (id: number) => request<LabRun>(`/api/lab/runs/${id}`),
+  reportPreview: (payload: ReportRequest) =>
+    request<ReportPreview>('/api/reports/preview', { method: 'POST', body: JSON.stringify(payload) }),
+  exportReport: async (payload: ReportRequest, format: 'pdf' | 'docx') => {
+    let response: Response
+    try {
+      response = await fetch(`${API_BASE}/api/reports/export/${format}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      })
+    } catch {
+      throw new Error(`Could not reach the API at ${API_BASE}. Check that the backend is running.`)
+    }
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`
+      try {
+        const body = await response.json() as { detail?: string }
+        if (body.detail) message = body.detail
+      } catch { /* Keep the HTTP status message for non-JSON errors. */ }
+      throw new Error(message)
+    }
+    const disposition = response.headers.get('Content-Disposition') || ''
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `ThreatHunter_Report.${format}`
+    return { blob: await response.blob(), filename }
+  },
 }

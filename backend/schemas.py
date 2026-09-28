@@ -109,3 +109,17 @@ class MitreTechniqueResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ReportRequest(BaseModel):
+    report_type: Literal["alerts", "incidents"]
+    alert_ids: list[int] | None = None
+    incident_ids: list[int] | None = None
+    severity: IncidentSeverity | None = None
+    status: IncidentStatus | None = None
+    alert_type: str | None = None
+    timestamp_from: datetime | None = None
+    timestamp_to: datetime | None = None
+
+    class Config:
+        extra = "forbid"
