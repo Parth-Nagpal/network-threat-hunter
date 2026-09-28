@@ -136,3 +136,15 @@ td strong { color: #dbe6ed; font-weight: 550; }.cell-sub { display: block; color
   .workspace-columns { grid-template-columns: 1fr; }.ioc-grid { grid-template-columns: 1fr 1fr; padding: 10px; gap: 7px; }.inline-fields { padding-inline: 13px; }.inline-fields label,.inline-fields select { min-width: 0; width: 100%; }.inline-fields { gap: 8px; }.association-add { padding-inline: 10px; }
   .app-footer { gap: 9px; font-size: 7px; }.app-footer span:last-child { text-align: right; }
 }
+.lab-scenario-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+.lab-scenario { display: flex; flex-direction: column; gap: 12px; padding: 18px; border: 1px solid var(--line, #263449); border-radius: 10px; background: rgba(12, 22, 37, .7); }
+.lab-scenario-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.lab-scenario h3 { margin: 0; font-size: 15px; }
+.lab-scenario p { margin: 0; color: var(--muted, #91a2b8); line-height: 1.5; }
+.lab-scenario small { color: var(--muted, #91a2b8); line-height: 1.45; }
+.lab-scenario .button { align-self: flex-start; margin-top: auto; }
+.lab-run-summary { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; color: var(--muted, #91a2b8); }
+.lab-result-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 0; border-top: 1px solid var(--line, #263449); }
+.lab-telemetry { margin-top: 16px; }
+.lab-telemetry summary { padding: 10px 0; cursor: pointer; color: var(--accent, #63c5e8); }
+.simulation-tag { display: inline-flex; margin-left: 6px; padding: 2px 5px; border-radius: 4px; background: rgba(73, 179, 151, .15); color: #72d9b8; font-size: 9px; font-weight: 700; letter-spacing: .06em; vertical-align: middle; }

@@ -145,3 +145,46 @@ class IncidentTechnique(Base):
     technique_id = Column(String, ForeignKey("mitre_techniques.technique_id", ondelete="CASCADE"), primary_key=True)
     incident = relationship("Incident")
     technique = relationship("MitreTechnique")
+
+
+class LabRun(Base):
+    __tablename__ = "lab_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(String, nullable=False, index=True)
+    scenario_name = Column(String, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="running", index=True)
+    generated_event_count = Column(Integer, nullable=False, default=0)
+    error = Column(String, nullable=True)
+    telemetry_links = relationship("LabRunTelemetry", back_populates="run", cascade="all, delete-orphan")
+    alert_links = relationship("LabRunAlert", back_populates="run", cascade="all, delete-orphan")
+    incident_links = relationship("LabRunIncident", back_populates="run", cascade="all, delete-orphan")
+
+
+class LabRunTelemetry(Base):
+    __tablename__ = "lab_run_telemetry"
+
+    run_id = Column(Integer, ForeignKey("lab_runs.id", ondelete="CASCADE"), primary_key=True)
+    event_type = Column(String, primary_key=True)
+    event_id = Column(Integer, primary_key=True)
+    run = relationship("LabRun", back_populates="telemetry_links")
+
+
+class LabRunAlert(Base):
+    __tablename__ = "lab_run_alerts"
+
+    run_id = Column(Integer, ForeignKey("lab_runs.id", ondelete="CASCADE"), primary_key=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="CASCADE"), primary_key=True)
+    run = relationship("LabRun", back_populates="alert_links")
+    alert = relationship("Alert")
+
+
+class LabRunIncident(Base):
+    __tablename__ = "lab_run_incidents"
+
+    run_id = Column(Integer, ForeignKey("lab_runs.id", ondelete="CASCADE"), primary_key=True)
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), primary_key=True)
+    run = relationship("LabRun", back_populates="incident_links")
+    incident = relationship("Incident")

@@ -70,6 +70,29 @@ export interface TelemetryEvent {
   destination_port: number | null
   protocol: string
   details: Record<string, unknown>
+  is_simulated?: boolean
+}
+
+export interface LabScenario {
+  id: string
+  name: string
+  description: string
+  detection: string
+  safety: string
+}
+
+export interface LabRun {
+  id: number
+  scenario: { id: string; name: string }
+  start_time: string
+  end_time: string | null
+  status: 'running' | 'completed' | 'failed'
+  generated_event_count: number
+  alert_ids: number[]
+  incident_ids: number[]
+  alerts?: Alert[]
+  incidents?: Pick<Incident, 'id' | 'title' | 'status' | 'severity'>[]
+  generated_telemetry?: TelemetryEvent[]
 }
 
 export interface IOCSet {
@@ -187,4 +210,9 @@ export const api = {
     request<{ incident_id: number; techniques: Technique[] }>(
       `/api/incidents/${incidentId}/techniques/${encodeURIComponent(techniqueId)}`, { method: 'DELETE' },
     ),
+  labScenarios: () => request<LabScenario[]>('/api/lab/scenarios'),
+  runLabScenario: (scenarioId: string) =>
+    request<LabRun>(`/api/lab/scenarios/${encodeURIComponent(scenarioId)}/run`, { method: 'POST' }),
+  labRuns: (limit = 100) => request<LabRun[]>(`/api/lab/runs?limit=${limit}`),
+  labRun: (id: number) => request<LabRun>(`/api/lab/runs/${id}`),
 }

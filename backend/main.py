@@ -121,12 +121,30 @@ from schemas import (
 )
 from correlation import correlate_open_alerts
 from mitre import ALERT_TYPE_TO_TECHNIQUE, seed_mitre_techniques
+from lab import scenario_catalog, run_scenario, run_response
 
 mitre_seed_session = SessionLocal()
 try:
     seed_mitre_techniques(mitre_seed_session)
 finally:
     mitre_seed_session.close()
+
+
+def _mark_simulated_events(db, events):
+    """Annotate normalized events using explicit run-to-telemetry links."""
+    ids_by_type = {}
+    for event in events:
+        ids_by_type.setdefault(event["event_type"], set()).add(event["id"])
+    simulated_ids = {}
+    for event_type, event_ids in ids_by_type.items():
+        rows = db.query(models.LabRunTelemetry.event_id).filter(
+            models.LabRunTelemetry.event_type == event_type,
+            models.LabRunTelemetry.event_id.in_(event_ids),
+        ).all()
+        simulated_ids[event_type] = {row[0] for row in rows}
+    for event in events:
+        event["is_simulated"] = event["id"] in simulated_ids.get(event["event_type"], set())
+    return events
 
 
 @app.get("/api/hunt")
@@ -226,7 +244,7 @@ def hunt_telemetry(
             })
 
     results.sort(key=lambda event: (event["timestamp"], event["id"]), reverse=True)
-    return results[:limit]
+    return _mark_simulated_events(db, results[:limit])
 
 
 @app.get("/api/hunt/alerts/{alert_id}")
@@ -472,7 +490,7 @@ def _related_incident_telemetry(db, related_ips, start_at, end_at, limit):
         rows = query.order_by(model.timestamp.desc(), model.id.desc()).limit(limit).all()
         results.extend(_normalized_telemetry(model, event_type, row) for row in rows)
     results.sort(key=lambda item: (item["timestamp"], item["id"]), reverse=True)
-    return results[:limit]
+    return _mark_simulated_events(db, results[:limit])
 
 
 def _extract_incident_iocs(alerts, telemetry):
@@ -796,3 +814,35 @@ def run_beaconing_detection(
         return {"status": "success", "alerts_created": alerts_created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/lab/scenarios")
+def list_lab_scenarios():
+    return scenario_catalog()
+
+
+@app.post("/api/lab/scenarios/{scenario_id}/run")
+def start_lab_run(scenario_id: str, db: Session = Depends(get_db)):
+    run = run_scenario(db, scenario_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Unknown lab scenario")
+    return run_response(db, run, detail=True)
+
+
+@app.get("/api/lab/runs")
+def list_lab_runs(
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    runs = db.query(models.LabRun).order_by(
+        models.LabRun.started_at.desc(), models.LabRun.id.desc()
+    ).limit(limit).all()
+    return [run_response(db, run) for run in runs]
+
+
+@app.get("/api/lab/runs/{run_id}")
+def get_lab_run(run_id: int, db: Session = Depends(get_db)):
+    run = db.query(models.LabRun).filter(models.LabRun.id == run_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Lab run not found")
+    return run_response(db, run, detail=True)

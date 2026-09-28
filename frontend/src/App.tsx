@@ -5,17 +5,20 @@ import {
   type Alert,
   type AlertStatus,
   type Incident,
+  type LabRun,
+  type LabScenario,
   type InvestigationAction,
   type Severity,
   type Technique,
   type TelemetryEvent,
 } from './api'
 
-type Page = 'Dashboard' | 'Alerts' | 'Threat Hunting' | 'Incidents' | 'Investigation' | 'MITRE ATT&CK' | 'Hosts' | 'Reports'
+type Page = 'Dashboard' | 'Alerts' | 'Threat Hunting' | 'Attack Lab' | 'Incidents' | 'Investigation' | 'MITRE ATT&CK' | 'Hosts' | 'Reports'
 const NAV: { name: Page; icon: string; section: string }[] = [
   { name: 'Dashboard', icon: '▦', section: 'WORKSPACE' },
   { name: 'Alerts', icon: '◈', section: 'WORKSPACE' },
   { name: 'Threat Hunting', icon: '⌕', section: 'WORKSPACE' },
+  { name: 'Attack Lab', icon: '⏵', section: 'WORKSPACE' },
   { name: 'Incidents', icon: '◎', section: 'RESPONSE' },
   { name: 'Investigation', icon: '⌖', section: 'RESPONSE' },
   { name: 'MITRE ATT&CK', icon: '▧', section: 'INTELLIGENCE' },
@@ -231,21 +234,66 @@ function HuntPage() {
 
 function TelemetryTable({ events }: { events: TelemetryEvent[] }) {
   return <div className="table-scroll"><table><thead><tr><th>Timestamp</th><th>Event</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Details</th></tr></thead><tbody>
-    {events.map((event, index) => <tr key={`${event.event_type}-${event.id}-${index}`}><td>{formatTime(event.timestamp)}</td><td><span className="event-type">{event.event_type}</span></td><td className="mono">{event.source_ip}{event.source_port !== null ? `:${event.source_port}` : ''}</td><td className="mono">{event.destination_ip}{event.destination_port !== null ? `:${event.destination_port}` : ''}</td><td>{event.protocol}</td><td><span className="truncate" title={JSON.stringify(event.details)}>{Object.entries(event.details).filter(([, value]) => value !== null).slice(0, 2).map(([key, value]) => `${key}: ${String(value)}`).join(' · ') || '—'}</span></td></tr>)}
+    {events.map((event, index) => <tr key={`${event.event_type}-${event.id}-${index}`}><td>{formatTime(event.timestamp)}</td><td><span className="event-type">{event.event_type}</span>{event.is_simulated && <span className="simulation-tag">SIM</span>}</td><td className="mono">{event.source_ip}{event.source_port !== null ? `:${event.source_port}` : ''}</td><td className="mono">{event.destination_ip}{event.destination_port !== null ? `:${event.destination_port}` : ''}</td><td>{event.protocol}</td><td><span className="truncate" title={JSON.stringify(event.details)}>{Object.entries(event.details).filter(([, value]) => value !== null).slice(0, 2).map(([key, value]) => `${key}: ${String(value)}`).join(' · ') || '—'}</span></td></tr>)}
   </tbody></table></div>
+}
+
+function AttackLabPage({ onInvestigate }: { onInvestigate: (id: number) => void }) {
+  const [scenarios, setScenarios] = useState<LabScenario[]>([])
+  const [runs, setRuns] = useState<LabRun[]>([])
+  const [selectedRun, setSelectedRun] = useState<LabRun | null>(null)
+  const [running, setRunning] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const refresh = useCallback(async () => {
+    setLoading(true); setError('')
+    try {
+      const [scenarioRows, runRows] = await Promise.all([api.labScenarios(), api.labRuns()])
+      setScenarios(scenarioRows); setRuns(runRows)
+      if (selectedRun) setSelectedRun(await api.labRun(selectedRun.id))
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load Attack Lab') }
+    finally { setLoading(false) }
+  }, [selectedRun])
+  useEffect(() => { void refresh() }, [])
+  async function runScenario(scenario: LabScenario) {
+    setRunning(scenario.id); setError('')
+    try {
+      const run = await api.runLabScenario(scenario.id)
+      setSelectedRun(run)
+      const history = await api.labRuns()
+      setRuns(history)
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Scenario run failed') }
+    finally { setRunning(null) }
+  }
+  return <>
+    <div className="page-intro"><div><p className="eyebrow">CONTROLLED SIMULATION</p><h2>Attack Lab</h2><p className="muted">Safe synthetic telemetry exercises the production detection, correlation, and investigation workflow.</p></div><button className="button button-secondary" onClick={() => void refresh()}>↻ Refresh</button></div>
+    {error && <StateMessage error={error} onRetry={() => void refresh()} />}
+    <Panel title="Available scenarios" subtitle="Local database records only · no packets, credentials, or external targets">
+      {loading ? <StateMessage loading /> : <div className="lab-scenario-grid">{scenarios.map((scenario) => <article className="lab-scenario" key={scenario.id}><div className="lab-scenario-title"><h3>{scenario.name}</h3><span className="event-type">{scenario.detection}</span></div><p>{scenario.description}</p><small>{scenario.safety}</small><button className="button button-primary" disabled={running !== null} onClick={() => void runScenario(scenario)}>{running === scenario.id ? 'Running…' : '▶ Run simulation'}</button></article>)}</div>}
+    </Panel>
+    {selectedRun && <Panel title={`Run #${selectedRun.id} · ${selectedRun.scenario.name}`} subtitle={`Started ${formatTime(selectedRun.start_time)}`}>
+      <div className="lab-run-summary"><Badge value={selectedRun.status} /><span>{selectedRun.generated_event_count} synthetic events</span><span>{selectedRun.alert_ids.length} alerts</span><span>{selectedRun.incident_ids.length} incidents</span></div>
+      {(selectedRun.alerts || []).map((alert) => <div className="lab-result-row" key={alert.id}><span>ALT-{alert.id} · {alert.rule_name}</span><Badge value={alert.severity} /></div>)}
+      {(selectedRun.incidents || []).map((incident) => <div className="lab-result-row" key={incident.id}><span>INC-{incident.id} · {incident.title} <Badge value={incident.severity} /></span><button className="button button-secondary" onClick={() => onInvestigate(incident.id)}>Investigate →</button></div>)}
+      {selectedRun.generated_telemetry?.length ? <details className="lab-telemetry"><summary>Generated telemetry ({selectedRun.generated_telemetry.length})</summary><TelemetryTable events={selectedRun.generated_telemetry} /></details> : null}
+    </Panel>}
+    <Panel title="Run history" subtitle="Recent simulation runs" action={<button className="button button-secondary" onClick={() => void refresh()}>↻ Refresh</button>}>
+      {!loading && !runs.length ? <StateMessage empty="No simulation runs yet." /> : <div className="table-scroll"><table><thead><tr><th>Scenario</th><th>Started</th><th>Status</th><th>Events</th><th>Alerts</th><th>Incidents</th><th /></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td>{run.scenario.name}</td><td>{formatTime(run.start_time)}</td><td><Badge value={run.status} /></td><td>{run.generated_event_count}</td><td>{run.alert_ids.length}</td><td>{run.incident_ids.length}</td><td><button className="text-button" onClick={async () => setSelectedRun(await api.labRun(run.id))}>View run</button></td></tr>)}</tbody></table></div>}
+    </Panel>
+  </>
 }
 
 function IncidentsPage() {
   return <IncidentWorkspace title="Incidents" subtitle="Correlated cases and response tracking" />
 }
 
-function InvestigationPage() {
-  return <IncidentWorkspace title="Investigation" subtitle="Evidence pivots, analyst notes, and actions" />
+function InvestigationPage({ incidentId }: { incidentId: number | null }) {
+  return <IncidentWorkspace title="Investigation" subtitle="Evidence pivots, analyst notes, and actions" initialIncidentId={incidentId} />
 }
 
-function IncidentWorkspace({ title, subtitle }: { title: string; subtitle: string }) {
+function IncidentWorkspace({ title, subtitle, initialIncidentId = null }: { title: string; subtitle: string; initialIncidentId?: number | null }) {
   const [incidents, setIncidents] = useState<Incident[]>([])
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedId, setSelectedId] = useState<number | null>(initialIncidentId)
   const [investigation, setInvestigation] = useState<Incident | null>(null)
   const [alerts, setAlerts] = useState<Alert[]>([])
   const [techniques, setTechniques] = useState<Technique[]>([])
@@ -386,6 +434,7 @@ function PlaceholderPage({ title }: { title: string }) {
 
 function App() {
   const [page, setPage] = useState<Page>('Dashboard')
+  const [investigateIncidentId, setInvestigateIncidentId] = useState<number | null>(null)
   const [health, setHealth] = useState<'healthy' | 'unhealthy' | 'loading'>('loading')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [healthError, setHealthError] = useState('')
@@ -406,7 +455,7 @@ function App() {
     {mobileNavOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
     <main className="main-area"><header className="topbar"><button className="mobile-menu" onClick={() => setMobileNavOpen(!mobileNavOpen)} aria-label="Toggle navigation">☰</button><div className="breadcrumb"><span>Network Threat Hunter</span><b>/</b><strong>{page}</strong></div><div className="topbar-right"><span className="utc-label">SOC CONSOLE</span><button className="top-health" onClick={() => void refreshHealth()}><i className={`sensor-indicator ${health}`} />{health === 'loading' ? 'Connecting' : health === 'healthy' ? 'System operational' : 'Backend offline'}</button></div></header>
       {healthError && <div className="global-api-error"><span>{healthError}</span><button onClick={() => void refreshHealth()}>Retry</button></div>}
-      <div className="page-content">{page === 'Dashboard' && <DashboardPage />}{page === 'Alerts' && <AlertsPage />}{page === 'Threat Hunting' && <HuntPage />}{page === 'Incidents' && <IncidentsPage />}{page === 'Investigation' && <InvestigationPage />}{page === 'MITRE ATT&CK' && <MitrePage />}{(page === 'Hosts' || page === 'Reports') && <PlaceholderPage title={page} />}</div>
+      <div className="page-content">{page === 'Dashboard' && <DashboardPage />}{page === 'Alerts' && <AlertsPage />}{page === 'Threat Hunting' && <HuntPage />}{page === 'Attack Lab' && <AttackLabPage onInvestigate={(id) => { setInvestigateIncidentId(id); navigate('Investigation') }} />}{page === 'Incidents' && <IncidentsPage />}{page === 'Investigation' && <InvestigationPage incidentId={investigateIncidentId} />}{page === 'MITRE ATT&CK' && <MitrePage />}{(page === 'Hosts' || page === 'Reports') && <PlaceholderPage title={page} />}</div>
       <footer className="app-footer"><span>NETWORK THREAT HUNTER <i>·</i> SOC WORKSPACE</span><span>DATA FROM CONFIGURED BACKEND APIS</span></footer>
     </main>
   </div>
